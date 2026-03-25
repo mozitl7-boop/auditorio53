@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { query } from "../../../../lib/db";
+import supabaseAdmin from "@/lib/supabaseServer";
 import { sendMagicLinkEmail } from "@/lib/send-magic-link";
 import crypto from "crypto";
 
@@ -10,28 +10,26 @@ export async function POST(req: Request) {
     if (!email)
       return NextResponse.json({ error: "email required" }, { status: 400 });
 
-    // Lookup user by email
-    const res = await query(
-      "select id, nombre, email, tipo_usuario from usuarios where lower(email)=lower($1) limit 1",
-      [email]
-    );
-    const user = res.rows && res.rows[0];
+    // Buscar usuario por email usando Supabase
+    const { data: users, error: userErr } = await supabaseAdmin
+      .from("usuarios")
+      .select("id,nombre,email,tipo_usuario")
+      .ilike("email", email)
+      .limit(1);
+    if (userErr) throw userErr;
+    const user = users && users[0];
     if (!user)
-      return NextResponse.json(
-        { error: "Usuario no encontrado. Regístrate primero." },
-        { status: 404 }
-      );
+      return NextResponse.json({ error: "Usuario no encontrado. Regístrate primero." }, { status: 404 });
 
     // Generar magic link para login
     const token = crypto.randomBytes(32).toString("hex");
     const expiresAt = new Date(new Date().getTime() + 24 * 60 * 60 * 1000);
 
-    // Guardar el magic link de login
-    await query(
-      `INSERT INTO magic_links (token, email, usuario_id, tipo, fecha_expiracion)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [token, email, user.id, "login", expiresAt]
-    );
+    // Guardar el magic link de login en Supabase
+    const { error: insertErr } = await supabaseAdmin.from("magic_links").insert([
+      { token, email, usuario_id: user.id, tipo: "login", fecha_expiracion: expiresAt },
+    ]);
+    if (insertErr) throw insertErr;
 
     // Enviar el enlace mágico por correo
     await sendMagicLinkEmail(email, token, "login");

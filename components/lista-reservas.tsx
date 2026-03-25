@@ -250,7 +250,7 @@ export function ListaReservas({
             // Availability filter
             if (onlyWithAvailability) {
               const asistentes = (asistentesRegistrados || []).filter(
-                (a) => a.reservaId === reserva.id
+                (a) => String(a.reservaId) === String(reserva.id)
               );
               const capacidadAuditorio = reserva.auditorio === "A" ? 168 : 168;
               const capacidadMaxima =
@@ -268,7 +268,7 @@ export function ListaReservas({
             // full events to appear when a search query is present (but they
             // will still show as full and not allow registration).
             const asistentesForThis = (asistentesRegistrados || []).filter(
-              (a) => a.reservaId === reserva.id
+              (a) => String(a.reservaId) === String(reserva.id)
             );
             const capacidadAuditorio2 = reserva.auditorio === "A" ? 168 : 168;
             const capacidadMaxima2 =
@@ -291,9 +291,9 @@ export function ListaReservas({
               reserva.organizadorId === usuarioActualId;
             const archivos = archivosSubidos[reserva.id] || [];
             const asistentes = (asistentesRegistrados || []).filter(
-              (a) => a.reservaId === reserva.id
+              (a) => String(a.reservaId) === String(reserva.id)
             );
-            const capacidadAuditorio = reserva.auditorio === "A" ? 200 : 150;
+            const capacidadAuditorio = reserva.auditorio === "A" ? 168 : 168;
             const capacidadMaxima =
               reserva.asistentes && reserva.asistentes > 0
                 ? Math.min(reserva.asistentes, capacidadAuditorio)
@@ -362,7 +362,7 @@ export function ListaReservas({
                       <div className="flex items-center gap-2">
                         <Users className="w-4 h-4 shrink-0" />
                         <span className="truncate">
-                          {reserva.asistentes} asistentes
+                          {asistentes.length} asistentes
                         </span>
                       </div>
                     </div>
@@ -528,53 +528,45 @@ export function ListaReservas({
                           </DialogContent>
                         </Dialog>
 
-                        {/* Dev-only direct delete button: bypass dialog to test handler */}
-                        {process.env.NODE_ENV !== "production" && (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            title="Eliminar (bypass dialog)"
-                            className="h-auto text-red-600"
-                            onClick={async () => {
-                              // guard against accidental deletes
-                              if (
-                                !window.confirm(
-                                  `CONFIRMAR: eliminar reserva ${reserva.titulo}?`
-                                )
+                        {/* Production delete button for organizers: shows for actual organizers */}
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          title="Eliminar evento"
+                          className="h-auto"
+                          onClick={async () => {
+                            // confirm delete action with user
+                            if (
+                              !window.confirm(
+                                `¿Confirmas eliminar el evento "${reserva.titulo}"? Esta acción no se puede deshacer.`
                               )
-                                return;
-                              console.info(
-                                "ListaReservas: DEV direct delete click",
-                                { reservaId: reserva.id }
+                            )
+                              return;
+                            setIsDeleting(true);
+                            try {
+                              const ok = await alEliminar(
+                                reserva.id,
+                                reserva.organizadorId as any
                               );
-                              setIsDeleting(true);
-                              try {
-                                const ok = await alEliminar(
-                                  reserva.id,
-                                  reserva.organizadorId as any
-                                );
-                                if (ok) {
-                                  toast({
-                                    title: "Eliminado",
-                                    description:
-                                      "Evento eliminado correctamente (dev)",
-                                  });
-                                } else {
-                                  toast({
-                                    title: "Error",
-                                    description:
-                                      "No se pudo eliminar el evento (dev)",
-                                    variant: "destructive",
-                                  });
-                                }
-                              } finally {
-                                setIsDeleting(false);
+                              if (ok) {
+                                toast({
+                                  title: "Evento eliminado",
+                                  description: "El evento fue eliminado correctamente",
+                                });
+                              } else {
+                                toast({
+                                  title: "Error",
+                                  description: "No se pudo eliminar el evento",
+                                  variant: "destructive",
+                                });
                               }
-                            }}
-                          >
-                            Borrar
-                          </Button>
-                        )}
+                            } finally {
+                              setIsDeleting(false);
+                            }
+                          }}
+                        >
+                          Borrar
+                        </Button>
                       </>
                     )}
                   </div>

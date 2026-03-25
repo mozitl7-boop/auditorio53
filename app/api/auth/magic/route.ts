@@ -1,6 +1,6 @@
-import { query } from "@/lib/db";
 import { signToken, serializeTokenCookie } from "@/lib/auth";
 import { NextResponse } from "next/server";
+import supabaseAdmin from "@/lib/supabaseServer";
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
@@ -14,22 +14,16 @@ export async function GET(request: Request) {
   }
 
   try {
-    // Buscar el magic link en la base de datos
-    const result = await query(
-      `SELECT id, email, usuario_id, tipo, nombre, tipo_usuario, data_json, usado, fecha_expiracion
-       FROM magic_links
-       WHERE token = $1 AND usado = FALSE`,
-      [token]
-    );
-
-    if (result.rows.length === 0) {
-      return NextResponse.json(
-        { error: "Enlace inválido o ya usado" },
-        { status: 400 }
-      );
-    }
-
-    const link = result.rows[0];
+    // Buscar el magic link en Supabase
+    const { data: links, error: linkErr } = await supabaseAdmin
+      .from("magic_links")
+      .select("*")
+      .eq("token", token)
+      .eq("usado", false)
+      .limit(1);
+    if (linkErr) throw linkErr;
+    if (!links || links.length === 0) return NextResponse.json({ error: "Enlace inválido o ya usado" }, { status: 400 });
+    const link = links[0];
 
     // Verificar que no haya expirado
     if (new Date(link.fecha_expiracion) < new Date()) {
@@ -40,39 +34,22 @@ export async function GET(request: Request) {
 
     // Si es un registro nuevo, crear el usuario
     if (link.tipo === "registro" && !userId) {
-      const createUserResult = await query(
-        `INSERT INTO usuarios (nombre, email, tipo_usuario)
-         VALUES ($1, $2, $3)
-         RETURNING id, nombre, email, tipo_usuario`,
-        [
-          link.nombre || link.email,
-          link.email,
-          (link.tipo_usuario || "asistente").toLowerCase(),
-        ]
-      );
-      userId = createUserResult.rows[0].id;
+      const { data: createdUsers, error: createErr } = await supabaseAdmin.from("usuarios").insert([
+        { nombre: link.nombre || link.email, email: link.email, tipo_usuario: (link.tipo_usuario || "asistente").toLowerCase() },
+      ]).select("id").limit(1);
+      if (createErr) throw createErr;
+      userId = createdUsers && createdUsers[0] && createdUsers[0].id;
     }
 
     // Marcar el magic link como usado
-    await query(
-      `UPDATE magic_links SET usado = TRUE, fecha_uso = NOW() WHERE id = $1`,
-      [link.id]
-    );
+    const { error: updErr } = await supabaseAdmin.from("magic_links").update({ usado: true, fecha_uso: new Date() }).eq("id", link.id);
+    if (updErr) throw updErr;
 
     // Obtener los datos del usuario
-    const userResult = await query(
-      `SELECT id, nombre, email, tipo_usuario FROM usuarios WHERE id = $1`,
-      [userId]
-    );
-
-    if (userResult.rows.length === 0) {
-      return NextResponse.json(
-        { error: "Usuario no encontrado" },
-        { status: 404 }
-      );
-    }
-
-    const user = userResult.rows[0];
+    const { data: userRows, error: userErr } = await supabaseAdmin.from("usuarios").select("id,nombre,email,tipo_usuario").eq("id", userId).limit(1);
+    if (userErr) throw userErr;
+    if (!userRows || userRows.length === 0) return NextResponse.json({ error: "Usuario no encontrado" }, { status: 404 });
+    const user = userRows[0];
 
     // Crear el token de sesión
     const token_jwt = signToken({

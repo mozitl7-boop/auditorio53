@@ -1,5 +1,10 @@
 import { NextResponse } from "next/server";
-import { query } from "@/lib/db";
+import { createClient } from "@supabase/supabase-js";
+
+const supabase = createClient(
+  process.env.SUPABASE_URL || "",
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE || ""
+);
 
 /**
  * API GET /api/asientos/[auditorioId] — obtener asientos de un auditorio
@@ -11,27 +16,19 @@ export async function GET(
   try {
     const auditorioId = params.auditorioId;
 
-    const result = await query(
-      `
-      SELECT 
-        id,
-        auditorio_id,
-        numero_asiento,
-        fila,
-        seccion,
-        estado
-      FROM asientos
-      WHERE auditorio_id = $1
-      ORDER BY numero_asiento
-      `,
-      [auditorioId]
-    );
+    const { data, error } = await supabase
+      .from("asientos")
+      .select("id,auditorio_id,numero_asiento,fila,seccion,estado")
+      .eq("auditorio_id", auditorioId)
+      .order("numero_asiento");
+
+    if (error) throw error;
 
     return NextResponse.json(
       {
         success: true,
-        count: result.rows.length,
-        asientos: result.rows,
+        count: (data || []).length,
+        asientos: data || [],
       },
       { status: 200 }
     );

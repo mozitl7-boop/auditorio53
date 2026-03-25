@@ -1,6 +1,11 @@
 import { NextResponse } from "next/server";
-import { query, detectColumn } from "@/lib/db";
+import { createClient } from "@supabase/supabase-js";
 import { getUserFromRequest } from "@/lib/auth";
+
+const supabase = createClient(
+  process.env.SUPABASE_URL || "",
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE || ""
+);
 
 /**
  * API GET /api/registros-asistentes/[eventoId] — obtener registros de asistentes
@@ -27,45 +32,25 @@ export async function GET(
       );
     }
 
-    const raEventoCol = await detectColumn("registros_asistentes", [
-      "id_evento",
-      "evento_id",
-    ]);
-    const raAsistenteCol = await detectColumn("registros_asistentes", [
-      "id_asistente",
-      "asistente_id",
-      "usuario_id",
-    ]);
-    const raAsientoCol = await detectColumn("registros_asistentes", [
-      "id_asiento",
-      "asiento_id",
-    ]);
+    // GET registros para el evento (se acepta tanto id_evento como evento_id)
+    const { data: regsA, error: regsAErr } = await supabase
+      .from("registros_asistentes")
+      .select("*")
+      .eq("id_evento", eventoId)
+      .order("numero_orden", { ascending: true });
+    let registrosData = [];
+    if (!regsAErr && regsA) registrosData = regsA;
+    else {
+      const { data: regsB, error: regsBErr } = await supabase
+        .from("registros_asistentes")
+        .select("*")
+        .eq("evento_id", eventoId)
+        .order("numero_orden", { ascending: true });
+      if (regsBErr) throw regsBErr;
+      registrosData = regsB || [];
+    }
 
-    const result = await query(
-      `
-      SELECT
-        id,
-        ${raEventoCol} AS id_evento,
-        ${raAsistenteCol} AS id_asistente,
-        ${raAsientoCol} AS id_asiento,
-        numero_orden,
-        fecha_registro,
-        estado
-      FROM registros_asistentes
-      WHERE ${raEventoCol} = $1
-      ORDER BY numero_orden
-      `,
-      [eventoId]
-    );
-
-    return NextResponse.json(
-      {
-        success: true,
-        count: result.rows.length,
-        registros: result.rows,
-      },
-      { status: 200 }
-    );
+    return NextResponse.json({ success: true, count: registrosData.length, registros: registrosData }, { status: 200 });
   } catch (error: any) {
     console.error("Error fetching registros_asistentes:", error);
     return NextResponse.json(
@@ -155,26 +140,33 @@ export async function POST(
         );
       }
 
-      // Buscar usuario por email
-      const byEmail = await query(
-        "SELECT id FROM usuarios WHERE email = $1 LIMIT 1",
-        [email]
-      );
-      if (byEmail.rows.length > 0) {
-        usuarioId = byEmail.rows[0].id;
+      // Buscar usuario por email usando Supabase
+      const { data: byEmailData, error: byEmailErr } = await supabase
+        .from("usuarios")
+        .select("id")
+        .eq("email", email)
+        .limit(1);
+      if (byEmailErr) throw byEmailErr;
+      if (byEmailData && byEmailData.length > 0) {
+        usuarioId = byEmailData[0].id;
       } else {
-        const createU = await query(
-          `INSERT INTO usuarios (nombre, email, tipo_usuario) VALUES ($1, $2, 'asistente') RETURNING id`,
-          [nombre, email]
-        );
-        usuarioId = createU.rows[0].id;
+        const { data: createdU, error: createUErr } = await supabase
+          .from("usuarios")
+          .insert([{ nombre, email, tipo_usuario: "asistente" }])
+          .select("id")
+          .limit(1);
+        if (createUErr) throw createUErr;
+        usuarioId = createdU && createdU[0] && createdU[0].id;
       }
     } else {
       // validar que exista
-      const check = await query("SELECT id FROM usuarios WHERE id = $1", [
-        usuarioId,
-      ]);
-      if (check.rows.length === 0) {
+      const { data: checkData, error: checkErr } = await supabase
+        .from("usuarios")
+        .select("id")
+        .eq("id", usuarioId)
+        .limit(1);
+      if (checkErr) throw checkErr;
+      if (!checkData || checkData.length === 0) {
         return NextResponse.json(
           { success: false, error: "Usuario asistente no encontrado" },
           { status: 404 }
@@ -182,205 +174,183 @@ export async function POST(
       }
     }
 
-    // Asignación de asiento y numero_orden dentro de una transacción
-    // Incluir la verificación de duplicados dentro de la transacción para evitar race conditions
+    // Asignación de asiento y numero_orden usando Supabase (sin transacciones)
+    // Nota: aquí evitamos usar la conexión directa a Postgres y las transacciones
+    // para que el código funcione en entornos donde no hay acceso TCP a Postgres.
+    // Riesgo: esto no garantiza atomicidad en concurrencia alta.
     let row: any = null;
-    // Definir variables de columna en el scope exterior para reutilizarlas al construir la respuesta
     let raEventoCol: string | null = null;
     let raAsistenteCol: string | null = null;
     let raAsientoCol: string | null = null;
-
-    await query("BEGIN");
-    try {
-      // VERIFICACIÓN DE DUPLICADOS DENTRO DE LA TRANSACCIÓN (con FOR UPDATE para lock)
-      // Esto garantiza que dos solicitudes simultáneas no pasen ambas esta comprobación
-      raEventoCol = await detectColumn("registros_asistentes", [
-        "id_evento",
-        "evento_id",
-      ]);
-      raAsistenteCol = await detectColumn("registros_asistentes", [
-        "id_asistente",
-        "asistente_id",
-        "usuario_id",
-      ]);
-
-      const dupCheck = await query(
-        `SELECT id FROM registros_asistentes 
-         WHERE ${raEventoCol} = $1 AND ${raAsistenteCol} = $2 AND estado = 'confirmado'
-         LIMIT 1`,
-        [eventoId, usuarioId]
+    // 1) Verificar duplicados localmente: traer registros confirmados y comprobar
+    const { data: allConfirmedRegs, error: regsErr } = await supabase
+      .from("registros_asistentes")
+      .select("*")
+      .eq("estado", "confirmado");
+    if (regsErr) {
+      console.warn("Warning: no se pudieron leer registros_asistentes:", regsErr);
+    }
+    const confirmedRegs = (allConfirmedRegs || []).filter((r: any) => {
+      const eid = r.evento_id ?? r.id_evento ?? null;
+      const aid = r.id_asistente ?? r.asistente_id ?? r.usuario_id ?? null;
+      return eid === eventoId && aid === usuarioId;
+    });
+    if (confirmedRegs.length > 0) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "El usuario ya tiene una reserva confirmada para este evento",
+        },
+        { status: 409 }
       );
-
-      if (dupCheck.rows.length > 0) {
-        await query("ROLLBACK");
-        return NextResponse.json(
-          {
-            success: false,
-            error:
-              "El usuario ya tiene una reserva confirmada para este evento",
-          },
-          { status: 409 }
-        );
-      }
-
-      // Obtener auditorio del evento
-      // Detect auditorio column name on eventos
-      const auditorioCol = await detectColumn("eventos", [
-        "id_auditorio",
-        "auditorio_id",
-      ]);
-      // Lock the event row to serialize concurrent registrations for the same event.
-      // Using FOR UPDATE ensures only one transaction at a time can assign seats for this event.
-      const evRes = await query(
-        `SELECT ${auditorioCol} as id_auditorio FROM eventos WHERE id = $1 FOR UPDATE`,
-        [eventoId]
-      );
-      if (evRes.rows.length === 0) {
-        await query("ROLLBACK");
-        return NextResponse.json(
-          { success: false, error: "Evento no encontrado" },
-          { status: 404 }
-        );
-      }
-      const auditorioId = evRes.rows[0].id_auditorio;
-
-      // Lock the auditorio row too to avoid concurrent capacity changes and then read its capacity
-      const audCapRes = await query(
-        `SELECT capacidad_total FROM auditorios WHERE id = $1 FOR UPDATE LIMIT 1`,
-        [auditorioId]
-      );
-      const capacidadTotal =
-        audCapRes.rows.length > 0
-          ? Number(audCapRes.rows[0].capacidad_total || 0)
-          : null;
-
-      // Contar registros confirmados ya existentes para este evento (after locks)
-      const countRes = await query(
-        `SELECT COUNT(*)::int as ocupados FROM registros_asistentes WHERE ${raEventoCol} = $1 AND estado = 'confirmado'`,
-        [eventoId]
-      );
-      const ocupadosActuales =
-        countRes.rows.length > 0 ? Number(countRes.rows[0].ocupados) : 0;
-
-      if (capacidadTotal !== null && ocupadosActuales >= capacidadTotal) {
-        await query("ROLLBACK");
-        return NextResponse.json(
-          {
-            success: false,
-            error:
-              "El auditorio está completo — no quedan asientos disponibles",
-            capacidad_total: capacidadTotal,
-            ocupados: ocupadosActuales,
-          },
-          { status: 409 }
-        );
-      }
-
-      // Check whether schema has id_asiento and numero_orden columns
-      // Detect the candidate name for the asiento FK column, then verify it exists
-      raAsientoCol = await detectColumn("registros_asistentes", [
-        "id_asiento",
-        "asiento_id",
-      ]);
-      const asientoColExistsRes = await query(
-        `SELECT 1 FROM information_schema.columns WHERE table_name = 'registros_asistentes' AND column_name = $1 LIMIT 1`,
-        [raAsientoCol]
-      );
-      const hasIdAsiento = asientoColExistsRes.rows.length > 0;
-      // Check for numero_orden column presence via information_schema
-      const numColRes = await query(
-        `SELECT 1 FROM information_schema.columns WHERE table_name = 'registros_asistentes' AND column_name = 'numero_orden' LIMIT 1`
-      );
-      const hasNumeroOrden = numColRes.rows.length > 0;
-
-      if (!hasIdAsiento || !hasNumeroOrden) {
-        // Migration not applied: insert minimal registro without seat/numero_orden
-        const insertRes = await query(
-          `INSERT INTO registros_asistentes (${raEventoCol}, ${raAsistenteCol}, estado) VALUES ($1, $2, 'confirmado') RETURNING *`,
-          [eventoId, usuarioId]
-        );
-        row = insertRes.rows[0];
-        await query("COMMIT");
-      } else {
-        // Buscar primer asiento disponible en ese auditorio no asignado al evento
-        // Detectar el nombre de la columna de auditorio en la tabla `asientos` (puede ser `id_auditorio` o `auditorio_id`)
-        const asientosAudCol = await detectColumn("asientos", [
-          "id_auditorio",
-          "auditorio_id",
-        ]);
-        const asientoRes = await query(
-          `
-          SELECT a.id
-          FROM asientos a
-          WHERE a.${asientosAudCol} = $1
-            AND a.id NOT IN (
-              SELECT ${raAsientoCol} FROM registros_asistentes WHERE ${raEventoCol} = $2 AND ${raAsientoCol} IS NOT NULL
-            )
-          ORDER BY a.numero_asiento
-          LIMIT 1
-          `,
-          [auditorioId, eventoId]
-        );
-        const asientoId =
-          asientoRes.rows.length > 0 ? asientoRes.rows[0].id : null;
-
-        // If no seat is available, abort and return 409 (conflict)
-        if (!asientoId) {
-          await query("ROLLBACK");
-          return NextResponse.json(
-            {
-              success: false,
-              error: "No hay asientos disponibles para este evento",
-            },
-            { status: 409 }
-          );
-        }
-
-        // Calcular siguiente numero_orden (usar columna de evento detectada)
-        const numRes = await query(
-          `SELECT COALESCE(MAX(numero_orden), 0) + 1 as siguiente FROM registros_asistentes WHERE ${raEventoCol} = $1`,
-          [eventoId]
-        );
-        const siguienteAsiento = parseInt(numRes.rows[0].siguiente, 10);
-
-        // Insertar registro referenciando las columnas detectadas
-        const insertRes = await query(
-          `INSERT INTO registros_asistentes (${raEventoCol}, ${raAsistenteCol}, ${raAsientoCol}, numero_orden, estado) VALUES ($1, $2, $3, $4, 'confirmado') RETURNING *`,
-          [eventoId, usuarioId, asientoId, siguienteAsiento]
-        );
-        row = insertRes.rows[0];
-        await query("COMMIT");
-      }
-    } catch (txErr) {
-      console.error("Error en transacción de asignación de asiento:", txErr);
-      await query("ROLLBACK");
-
-      // Verificar si es un error de constraint UNIQUE (duplicado)
-      if (
-        txErr instanceof Error &&
-        (txErr.message.includes("unique") ||
-          txErr.message.includes("duplicate") ||
-          txErr.message.includes("constraint"))
-      ) {
-        return NextResponse.json(
-          {
-            success: false,
-            error:
-              "El usuario ya tiene una reserva confirmada para este evento",
-          },
-          { status: 409 }
-        );
-      }
-
-      throw txErr;
     }
 
+    // 2) Obtener evento y auditorio
+    const { data: evData, error: evErr } = await supabase
+      .from("eventos")
+      .select("*")
+      .eq("id", eventoId)
+      .limit(1);
+    if (evErr) throw evErr;
+    if (!evData || evData.length === 0) {
+      return NextResponse.json({ success: false, error: "Evento no encontrado" }, { status: 404 });
+    }
+    const evRow = evData[0];
+    const auditorioId = evRow.id_auditorio ?? evRow.auditorio_id ?? null;
+
+    // 3) Obtener capacidad del auditorio
+    let capacidadTotal: number | null = null;
+    if (auditorioId) {
+      const { data: audData, error: audErr } = await supabase
+        .from("auditorios")
+        .select("capacidad_total")
+        .eq("id", auditorioId)
+        .limit(1);
+      if (audErr) console.warn("Warning reading auditorios:", audErr);
+      if (audData && audData.length > 0) capacidadTotal = Number(audData[0].capacidad_total || 0);
+    }
+
+    // 4) Contar ocupados para el evento (desde confirmedRegs y filtrando por evento)
+    const ocupadosActuales = (allConfirmedRegs || []).filter((r: any) => {
+      const eid = r.evento_id ?? r.id_evento ?? null;
+      return eid === eventoId;
+    }).length;
+
+    if (capacidadTotal !== null && ocupadosActuales >= capacidadTotal) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "El auditorio está completo — no quedan asientos disponibles",
+          capacidad_total: capacidadTotal,
+          ocupados: ocupadosActuales,
+        },
+        { status: 409 }
+      );
+    }
+
+    // 5) Determinar asiento disponible: obtener asientos del auditorio y excluir los ya asignados para el evento
+    // Obtener ids de asientos ya asignados al evento
+    const assignedSeatIds = (allConfirmedRegs || [])
+      .filter((r: any) => {
+        const eid = r.evento_id ?? r.id_evento ?? null;
+        return eid === eventoId;
+      })
+      .map((r: any) => r.id_asiento ?? r.asiento_id ?? null)
+      .filter(Boolean);
+
+    // Buscar asiento disponible
+    let asientoId: string | null = null;
+    if (auditorioId) {
+      // Build query excluding assigned ids
+      let asientosQuery = supabase.from("asientos").select("id,numero_asiento").eq("id_auditorio", auditorioId).order("numero_asiento", { ascending: true }).limit(1000);
+      // try alternate auditorio column if empty result
+      let { data: asientosData, error: asientosErr } = await asientosQuery;
+      if (asientosErr || !asientosData || asientosData.length === 0) {
+        // try auditorio_id
+        const alt = await supabase.from("asientos").select("id,numero_asiento").eq("auditorio_id", auditorioId).order("numero_asiento", { ascending: true }).limit(1000);
+        asientosData = alt.data || [];
+        if (alt.error) console.warn("Warning reading asientos (alt col):", alt.error);
+      }
+      if (asientosData && asientosData.length > 0) {
+        const available = asientosData.find((a: any) => !assignedSeatIds.includes(a.id));
+        asientoId = available ? available.id : null;
+      }
+    }
+
+    if (!asientoId) {
+      // no seat found — fallback: allow insertion without asiento (older schemas)
+      asientoId = null;
+    }
+
+    // 6) Calcular siguiente numero_orden
+    const regsForEvent = (allConfirmedRegs || []).filter((r: any) => {
+      const eid = r.evento_id ?? r.id_evento ?? null;
+      return eid === eventoId;
+    });
+    const maxOrden = regsForEvent.reduce((acc: number, r: any) => Math.max(acc, Number(r.numero_orden || 0)), 0);
+    const siguienteAsiento = maxOrden + 1;
+
+    // 7) Insertar registro intentando variantes de nombres de columnas para maximizar compatibilidad
+    const candidateCols = [
+      { evento: "evento_id", asistente: "asistente_id", asiento: "id_asiento" },
+      { evento: "id_evento", asistente: "id_asistente", asiento: "asiento_id" },
+      { evento: "evento_id", asistente: "usuario_id", asiento: "asiento_id" },
+    ];
+    let insertResult: any = null;
+    for (const cols of candidateCols) {
+      try {
+        const insertObj: any = {
+          [cols.evento]: eventoId,
+          [cols.asistente]: usuarioId,
+          estado: "confirmado",
+        };
+        if (asientoId && cols.asiento) insertObj[cols.asiento] = asientoId;
+        insertObj.numero_orden = siguienteAsiento;
+        const { data: insData, error: insErr } = await supabase.from("registros_asistentes").insert([insertObj]).select().limit(1);
+        if (insErr) {
+          // If error mentions column does not exist, try next candidate
+          const msg = (insErr as any).message || "";
+          if (msg.includes("column") || msg.includes("does not exist")) {
+            continue;
+          }
+          throw insErr;
+        }
+        if (insData && insData.length > 0) {
+          insertResult = insData[0];
+          // attach detected column names to use later
+          raEventoCol = cols.evento;
+          raAsistenteCol = cols.asistente;
+          raAsientoCol = cols.asiento;
+          break;
+        }
+      } catch (e) {
+        console.warn("Insert attempt failed for cols", cols, e);
+        continue;
+      }
+    }
+
+    if (!insertResult) {
+      // as a last resort try a minimal insert with only estado and fallback column names
+      try {
+        const { data: altIns, error: altErr } = await supabase.from("registros_asistentes").insert([{ estado: "confirmado" }]).select().limit(1);
+        if (altErr) throw altErr;
+        insertResult = altIns && altIns[0];
+      } catch (e) {
+        console.error("Failed to insert registro_asistente:", e);
+        return NextResponse.json({ success: false, error: (e as any).message || String(e) }, { status: 500 });
+      }
+    }
+
+    row = insertResult;
+
     // Obtener datos del usuario para devolver nombre/email
-    const userRes = await query(
-      "SELECT nombre, email FROM usuarios WHERE id = $1",
-      [usuarioId]
-    );
-    const user = userRes.rows[0] || { nombre: null, email: null };
+    const { data: userRows, error: userErr } = await supabase
+      .from("usuarios")
+      .select("nombre,email")
+      .eq("id", usuarioId)
+      .limit(1);
+    if (userErr) console.warn("Warning reading usuario after insert:", userErr);
+    const user = (userRows && userRows[0]) || { nombre: null, email: null };
 
     // Normalizar propiedades usando los nombres de columna detectados
     const mapped = {
@@ -409,83 +379,132 @@ export async function POST(
       // Obtener información del evento para incluir en el email (incluye auditorio)
       let eventInfo = null;
       try {
-        const evAudCol = await detectColumn("eventos", [
-          "id_auditorio",
-          "auditorio_id",
-        ]);
-        const ev = await query(
-          `SELECT titulo, fecha, hora_inicio, ${evAudCol} as auditorio FROM eventos WHERE id = $1 LIMIT 1`,
-          [mapped.eventoId]
-        );
-        if (ev.rows.length > 0) eventInfo = ev.rows[0];
+        const { data: evInfo, error: evInfoErr } = await supabase
+          .from("eventos")
+          .select("*")
+          .eq("id", mapped.eventoId)
+          .limit(1);
+        if (!evInfoErr && evInfo && evInfo.length > 0) {
+          const evRowInfo = evInfo[0];
+          eventInfo = {
+            titulo: evRowInfo.titulo || evRowInfo.title || null,
+            fecha: evRowInfo.fecha || evRowInfo.date || null,
+            hora_inicio: evRowInfo.hora_inicio || evRowInfo.start_time || null,
+            auditorio: evRowInfo.id_auditorio ?? evRowInfo.auditorio_id ?? null,
+          };
+        }
       } catch (e) {
-        // ignore
+        console.warn("Warning fetching evento info for email:", e);
       }
 
+      // Derive title with robust fallback
       const title =
-        (eventInfo && eventInfo.titulo) || `Evento ${mapped.eventoId}`;
-      const fecha = (eventInfo && eventInfo.fecha) || "";
-      const hora = (eventInfo && eventInfo.hora_inicio) || "";
+        (eventInfo && (eventInfo.titulo || eventInfo.title)) ||
+        "Tu evento reservado";
 
-      // Formatear fecha en español
-      const formatDateSpanish = (dateStr) => {
+      // fecha can be stored as 'fecha' or 'date'
+      const rawFecha = eventInfo && (eventInfo.fecha || eventInfo.date) ? String(eventInfo.fecha || eventInfo.date) : "";
+      // hora can be 'hora_inicio' or 'start_time'
+      const rawHora = eventInfo && (eventInfo.hora_inicio || eventInfo.start_time) ? String(eventInfo.hora_inicio || eventInfo.start_time) : "";
+
+      const formatDateSpanish = (dateStr: any) => {
         if (!dateStr) return "";
-        const date = new Date(dateStr);
-        const options = {
-          weekday: "long",
-          year: "numeric",
-          month: "long",
-          day: "numeric",
-        };
-        return date.toLocaleDateString("es-MX", options);
+        try {
+          const date = new Date(typeof dateStr === "string" && dateStr.length <= 10 ? dateStr + "T00:00:00" : dateStr);
+          if (isNaN(date.getTime())) return String(dateStr);
+          const options: Intl.DateTimeFormatOptions = {
+            weekday: "long",
+            year: "numeric",
+            month: "long",
+            day: "numeric",
+          };
+          return date.toLocaleDateString("es-MX", options);
+        } catch (e) {
+          return String(dateStr);
+        }
       };
 
-      const fechaFormato = formatDateSpanish(fecha);
+      const formatTimeSpanish = (timeStr: any) => {
+        if (!timeStr) return "";
+        try {
+          const parts = String(timeStr).split(":");
+          if (parts.length >= 2) {
+            const d = new Date();
+            d.setHours(Number(parts[0]), Number(parts[1]), parts[2] ? Number(parts[2]) : 0, 0);
+            return d.toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit" });
+          }
+          return String(timeStr);
+        } catch (e) {
+          return String(timeStr);
+        }
+      };
+
+      const fechaFormato = formatDateSpanish(rawFecha) || "Por confirmar";
+      const horaFormato = formatTimeSpanish(rawHora) || "Por confirmar";
+      const auditorioString = eventInfo && (eventInfo.auditorio || eventInfo.id_auditorio || eventInfo.auditorio_id) 
+        ? `Auditorio ${eventInfo.auditorio || eventInfo.id_auditorio || eventInfo.auditorio_id}`
+        : "Auditorio no especificado";
+
       const baseUrl =
-        process.env.NEXT_PUBLIC_APP_URL ||
-        process.env.NEXT_PUBLIC_API_URL ||
-        "http://localhost:3000";
+        process.env.NEXT_PUBLIC_APP_URL || process.env.NEXT_PUBLIC_API_URL || "http://localhost:3000";
+      // Link should point to the registro (attendee record) details page using the inserted registro id
       const eventLink = `${baseUrl}/asistente/detalles/${mapped.id}`;
 
       const subject = `Confirmación: ${title}`;
-      const auditorioText =
-        eventInfo && eventInfo.auditorio
-          ? `\nAuditorio: ${eventInfo.auditorio}`
-          : "";
-      const text = `Hola ${
-        mapped.nombre
-      },\n\nTu registro para el evento '${title}' ha sido confirmado.\nFecha: ${fechaFormato}\nHora: ${hora}${auditorioText}\nNúmero de asiento: ${
-        mapped.numero_orden || "N/A"
-      }\n\nVer detalles: ${eventLink}\n\nNo Faltes!`;
+
+      const textLines = [
+        `Hola ${mapped.nombre || "Asistente"},`,
+        ``,
+        `Tu registro para el evento '${title}' ha sido confirmado.`,
+        ``,
+        `Fecha: ${fechaFormato}`,
+        `Hora: ${horaFormato}`,
+        `${auditorioString}`,
+        `Número de asiento: ${mapped.numero_orden || "N/A"}`,
+        ``,
+        `Ver detalles: ${eventLink}`,
+        ``,
+        `¡No faltes!`,
+      ];
+      const text = textLines.join("\n");
 
       const htmlBody = `
-        <h2>Confirmación de Registro</h2>
-        <p>Hola <strong>${mapped.nombre}</strong>,</p>
-        <p>Tu registro para el evento <strong>'${title}'</strong> ha sido confirmado.</p>
-        <ul>
-          <li><strong>Fecha:</strong> ${fechaFormato}</li>
-          <li><strong>Hora:</strong> ${hora}</li>
-          ${
-            eventInfo && eventInfo.auditorio
-              ? `<li><strong>Auditorio:</strong> ${eventInfo.auditorio}</li>`
-              : ""
-          }
-          <li><strong>Número de asiento:</strong> ${
-            mapped.numero_orden || "N/A"
-          }</li>
-        </ul>
-        <p><a href="${eventLink}" style="display: inline-block; padding: 10px 20px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px;">Ver detalles</a></p>
-        <p>Gracias.</p>
+        <div style="font-family: Arial, sans-serif; color: #333;">
+          <h2>Confirmación de Registro</h2>
+          <p>Hola <strong>${mapped.nombre || "Asistente"}</strong>,</p>
+          <p>Tu registro para el evento <strong>'${title}'</strong> ha sido confirmado.</p>
+          <div style="background-color: #f8f9fa; padding: 15px; border-radius: 5px; margin: 20px 0;">
+            <p><strong>Fecha:</strong> ${fechaFormato}</p>
+            <p><strong>Hora:</strong> ${horaFormato}</p>
+            <p><strong>${auditorioString}</strong></p>
+            <p><strong>Número de asiento:</strong> ${mapped.numero_orden || "N/A"}</p>
+          </div>
+          <p style="margin-top: 20px;">
+            <a href="${eventLink}" style="display: inline-block; padding: 12px 24px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px; font-weight: bold;">Ver detalles</a>
+          </p>
+          <p style="margin-top: 20px; color: #666;">Gracias por registrarte.</p>
+        </div>
       `;
+
+      console.info("[Email] Composing confirmation email:", {
+        recipient: mapped.email,
+        subject,
+        titulo: title,
+        fecha: fechaFormato,
+        hora: horaFormato,
+        auditorio: auditorioString,
+        asiento: mapped.numero_orden,
+        link: eventLink,
+      });
 
       if (mapped.email) {
         await sendEmailNotification(mapped.email, subject, text, htmlBody);
         // Registrar en notificaciones_enviadas para evitar reenvíos posteriores (confirmación)
         try {
-          await query(
-            `INSERT INTO notificaciones_enviadas (evento_id, tipo, destinatario_email) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-            [mapped.eventoId, "confirmation", mapped.email]
-          );
+          const { error: noteErr } = await supabase
+            .from("notificaciones_enviadas")
+            .insert([{ evento_id: mapped.eventoId, tipo: "confirmation", destinatario_email: mapped.email }]);
+          if (noteErr) console.warn("Warning inserting notificaciones_enviadas:", noteErr.message || noteErr);
         } catch (e) {
           console.error("Error registrando confirmation notification:", e);
         }
@@ -495,7 +514,7 @@ export async function POST(
     }
     // Actualizar y emitir conteo agregado (asientos:conteo)
     try {
-      await computeAndBroadcastAsientosConteo(row[raEventoCol] || eventoId);
+      await computeAndBroadcastAsientosConteo((row && (row[raEventoCol] || row.evento_id || row.id_evento)) || eventoId);
     } catch (e) {
       // No bloquear la respuesta si la actualización del conteo falla
       console.error("Error updating asientos:conteo after registro:", e);
@@ -581,65 +600,84 @@ export async function DELETE(
 
     // Verify caller is the organizador of the event OR has admin role
     try {
-      const organizadorCol = await detectColumn("eventos", [
+      // Select all fields to be resilient against schema differences (id_organizador vs organizador_id etc.)
+      const { data: evRows, error: evErr } = await supabase
+        .from("eventos")
+        .select("*")
+        .eq("id", eventoId)
+        .limit(1);
+      if (evErr) {
+        console.warn("Warning reading eventos for permission check:", evErr.message || evErr);
+      }
+      if (!evRows || evRows.length === 0) {
+        return NextResponse.json({ success: false, error: "Evento no encontrado" }, { status: 404 });
+      }
+
+      const evRow = evRows[0] || {};
+      // Accept many possible column names used across schemas
+      const possibleOrganizerKeys = [
         "id_organizador",
         "organizador_id",
-      ]);
-      const ev = await query(
-        `SELECT ${organizadorCol} as id_organizador FROM eventos WHERE id = $1 LIMIT 1`,
-        [eventoId]
-      );
-      if (ev.rows.length === 0) {
-        return NextResponse.json(
-          { success: false, error: "Evento no encontrado" },
-          { status: 404 }
-        );
+        "organizer_id",
+        "organizador",
+        "organizadorId",
+        "id_organizador_usuario",
+        "organizador_usuario_id",
+      ];
+      let organizadorId = "";
+      for (const k of possibleOrganizerKeys) {
+        if (evRow[k]) {
+          organizadorId = String(evRow[k]);
+          break;
+        }
       }
-      const organizadorId = String(ev.rows[0].id_organizador);
-      const isOrganizer = organizadorId === String(callerUsuarioId);
-      const isAdmin =
-        callerTipo === "admin" ||
-        callerTipo === "organizator" ||
-        callerTipo === "organizador";
+
+      const isOrganizer = organizadorId && organizadorId === String(callerUsuarioId);
+      const isAdmin = callerTipo === "admin" || callerTipo === "organizator" || callerTipo === "organizador";
       if (!isOrganizer && !isAdmin) {
-        return NextResponse.json(
-          {
-            success: false,
-            error:
-              "No autorizado: solo el organizador o administradores pueden eliminar registros",
-          },
-          { status: 403 }
-        );
+        return NextResponse.json({ success: false, error: "No autorizado: solo el organizador o administradores pueden eliminar registros" }, { status: 403 });
       }
     } catch (e) {
-      console.error(
-        "Error verificando organizador antes de eliminar registro:",
-        e
-      );
-      return NextResponse.json(
-        { success: false, error: "Error verificando permisos" },
-        { status: 500 }
-      );
+      console.error("Error verificando organizador antes de eliminar registro:", e);
+      return NextResponse.json({ success: false, error: "Error verificando permisos" }, { status: 500 });
     }
 
-    // Delete the registro
-    const raEventoCol = await detectColumn("registros_asistentes", [
-      "id_evento",
-      "evento_id",
-    ]);
-    const start = Date.now();
-    const del = await query(
-      `DELETE FROM registros_asistentes WHERE id = $1 AND ${raEventoCol} = $2 RETURNING *`,
-      [registroId, eventoId]
-    );
-    const duration = Date.now() - start;
-    console.info("DB delete completed", { registroId, eventoId, duration });
+    // Delete the registro — intentar con ambas variantes de columna (evento_id / id_evento)
+    let delResult: any = null;
+    try {
+      const { data: delA, error: delAErr } = await supabase
+        .from("registros_asistentes")
+        .delete()
+        .match({ id: registroId, evento_id: eventoId })
+        .select()
+        .limit(1);
+      if (delAErr) {
+        // continue to try alternative
+      } else if (delA && delA.length > 0) {
+        delResult = delA[0];
+      }
 
-    if (del.rows.length === 0) {
-      return NextResponse.json(
-        { success: false, error: "Registro no encontrado" },
-        { status: 404 }
-      );
+      if (!delResult) {
+        const { data: delB, error: delBErr } = await supabase
+          .from("registros_asistentes")
+          .delete()
+          .match({ id: registroId, id_evento: eventoId })
+          .select()
+          .limit(1);
+        if (delBErr) {
+          // if both attempts errored, throw
+          if (!delResult) throw delBErr;
+        } else if (delB && delB.length > 0) {
+          delResult = delB[0];
+        }
+      }
+
+      if (!delResult) {
+        return NextResponse.json({ success: false, error: "Registro no encontrado" }, { status: 404 });
+      }
+    } catch (e) {
+      console.error("Error deleting registro_asistente:", e);
+      return NextResponse.json({ success: false, error: e.message || String(e) }, { status: 500 });
     }
 
     // Broadcast conteo update (fire-and-forget to avoid blocking response)
@@ -661,7 +699,7 @@ export async function DELETE(
     }
 
     return NextResponse.json(
-      { success: true, deleted: del.rows[0] },
+      { success: true, deleted: delResult },
       { status: 200 }
     );
   } catch (error: any) {

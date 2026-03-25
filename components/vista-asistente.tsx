@@ -123,8 +123,15 @@ export function VistaAsistente({
     return registrosActuales.filter((a) => a.reservaId === reservaId).length;
   };
 
-  const obtenerCapacidadMaxima = (auditorio: "A" | "B") => {
-    return auditorio === "A" ? 168 : 168;
+  // Determine capacity for a given reserva: prefer server-provided capacity, then reserva.capacidad_total,
+  // then reserva.asistentes (asistentes_esperados), and finally fall back to auditorio default (168).
+  const obtenerCapacidadMaxima = (reserva: Reserva) => {
+    const servidor = conteosServidor[reserva.id];
+    if (servidor && typeof servidor.capacidad === "number" && servidor.capacidad > 0)
+      return servidor.capacidad;
+    if (reserva.capacidad_total && reserva.capacidad_total > 0) return reserva.capacidad_total;
+    if (reserva.asistentes && reserva.asistentes > 0) return reserva.asistentes;
+    return reserva.auditorio === "A" ? 168 : 168;
   };
 
   const estaLleno = (reserva: Reserva) => {
@@ -351,26 +358,13 @@ export function VistaAsistente({
             {eventosFiltrados.map((reserva) => {
               const asientosOcupados = obtenerAsientosOcupados(reserva.id);
               const servidor = conteosServidor[reserva.id];
-              const capacidadAuditorio = obtenerCapacidadMaxima(
-                reserva.auditorio
-              );
-              const capacidadMaxima =
-                servidor && servidor.capacidad && servidor.capacidad > 0
-                  ? Math.min(
-                      reserva.asistentes && reserva.asistentes > 0
-                        ? Math.min(reserva.asistentes, servidor.capacidad)
-                        : servidor.capacidad,
-                      servidor.capacidad
-                    )
-                  : reserva.asistentes && reserva.asistentes > 0
-                  ? Math.min(reserva.asistentes, capacidadAuditorio)
-                  : capacidadAuditorio;
+              const capacidadAuditorio = obtenerCapacidadMaxima(reserva);
+              const capacidadMaxima = capacidadAuditorio;
               const displayedOcupados =
                 servidor && typeof servidor.ocupados === "number"
                   ? servidor.ocupados
                   : asientosOcupados;
-              const porcentajeOcupacion =
-                (displayedOcupados / capacidadMaxima) * 100;
+              const porcentajeOcupacion = (displayedOcupados / Math.max(1, capacidadMaxima)) * 100;
               const yaRegistrado = registrosActuales.some(
                 (a) =>
                   a.reservaId === reserva.id &&

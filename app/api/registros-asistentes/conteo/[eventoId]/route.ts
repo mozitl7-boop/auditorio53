@@ -1,5 +1,10 @@
 import { NextResponse } from "next/server";
-import { query, detectColumn } from "@/lib/db";
+import { createClient } from "@supabase/supabase-js";
+
+const supabase = createClient(
+  process.env.SUPABASE_URL || "",
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE || ""
+);
 
 /**
  * GET /api/registros-asistentes/conteo/[eventoId]
@@ -24,48 +29,35 @@ export async function GET(
       );
     }
 
-    const auditorioCol = await detectColumn("eventos", [
-      "id_auditorio",
-      "auditorio_id",
-    ]);
-    const raEventoCol = await detectColumn("registros_asistentes", [
-      "id_evento",
-      "evento_id",
-    ]);
+    // Obtener evento y auditorio
+    const { data: evs, error: evErr } = await supabase.from("eventos").select("id,id_auditorio,auditorio_id").eq("id", eventoId).limit(1);
+    if (evErr) throw evErr;
+    if (!evs || evs.length === 0) return NextResponse.json({ success: false, error: "Evento no encontrado" }, { status: 404 });
+    const ev = evs[0];
+    const audId = ev.id_auditorio ?? ev.auditorio_id ?? null;
 
-    const result = await query(
-      `
-      SELECT
-        e.id as id_evento,
-        e.${auditorioCol} as id_auditorio,
-        COALESCE(a.capacidad_total, 0) as capacidad_total,
-        COUNT(ra.*) FILTER (WHERE ra.estado = 'confirmado') as ocupados
-      FROM eventos e
-      LEFT JOIN auditorios a ON e.${auditorioCol} = a.id
-      LEFT JOIN registros_asistentes ra ON ra.${raEventoCol} = e.id
-      WHERE e.id = $1
-      GROUP BY e.id, e.${auditorioCol}, a.capacidad_total
-      `,
-      [eventoId]
-    );
-
-    if (result.rows.length === 0) {
-      return NextResponse.json(
-        { success: false, error: "Evento no encontrado" },
-        { status: 404 }
-      );
+    // Obtener capacidad del auditorio
+    let capacidad_total = 0;
+    if (audId) {
+      const { data: auds, error: audErr } = await supabase.from("auditorios").select("capacidad_total").eq("id", audId).limit(1);
+      if (audErr) throw audErr;
+      capacidad_total = Number(auds && auds[0] ? auds[0].capacidad_total || 0 : 0);
     }
 
-    const row = result.rows[0];
+    // Contar registros confirmados
+    const { data: regs, error: regsErr } = await supabase.from("registros_asistentes").select("id").or(`evento_id.eq.${eventoId},id_evento.eq.${eventoId}`).eq("estado", "confirmado");
+    if (regsErr) throw regsErr;
+    const ocupados = (regs || []).length;
+
     const payload = {
-      reservaId: row.id_evento,
-      eventoId: row.id_evento,
-      id_evento: row.id_evento,
-      auditorio: row.id_auditorio,
-      id_auditorio: row.id_auditorio,
-      ocupados: parseInt(row.ocupados, 10) || 0,
-      capacidad: parseInt(row.capacidad_total, 10) || 0,
-      capacidad_total: parseInt(row.capacidad_total, 10) || 0,
+      reservaId: eventoId,
+      eventoId,
+      id_evento: eventoId,
+      auditorio: audId,
+      id_auditorio: audId,
+      ocupados: ocupados || 0,
+      capacidad: capacidad_total || 0,
+      capacidad_total: capacidad_total || 0,
     };
 
     return NextResponse.json(

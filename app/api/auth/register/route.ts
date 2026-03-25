@@ -1,6 +1,11 @@
-import { query } from "@/lib/db";
+import { createClient } from "@supabase/supabase-js";
 import { sendMagicLinkEmail } from "@/lib/send-magic-link";
 import crypto from "crypto";
+
+const supabase = createClient(
+  process.env.SUPABASE_URL || "",
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE || ""
+);
 
 export async function POST(request: Request) {
   const { email, nombre, tipo_usuario } = await request.json();
@@ -15,20 +20,19 @@ export async function POST(request: Request) {
     const now = new Date();
     const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 24 horas
 
-    // Guardar el enlace mágico en la base de datos
-    await query(
-      `INSERT INTO magic_links (token, email, tipo, nombre, tipo_usuario, data_json, fecha_expiracion)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [
+    // Guardar el enlace mágico en la base de datos vía Supabase
+    const { error: insertErr } = await supabase.from("magic_links").insert([
+      {
         token,
-        email.toLowerCase(),
-        "registro",
-        nombre || null,
-        (tipo_usuario || "asistente").toLowerCase(),
-        JSON.stringify({ nombre, tipo_usuario }),
-        expiresAt,
-      ]
-    );
+        email: email.toLowerCase(),
+        tipo: "registro",
+        nombre: nombre || null,
+        tipo_usuario: (tipo_usuario || "asistente").toLowerCase(),
+        data_json: JSON.stringify({ nombre, tipo_usuario }),
+        fecha_expiracion: expiresAt,
+      },
+    ]);
+    if (insertErr) throw insertErr;
 
     // Enviar el enlace mágico por correo
     await sendMagicLinkEmail(email, token, "registro");

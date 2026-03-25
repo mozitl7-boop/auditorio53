@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
 export async function POST() {
-  // Clear cookie by setting max-age=0
+  // Borrar cookie estableciendo max-age=0
   return NextResponse.json(
     { ok: true },
     {

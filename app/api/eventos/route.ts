@@ -1,84 +1,150 @@
 import { NextResponse } from "next/server";
-import { query } from "@/lib/db";
+import { createClient } from "@supabase/supabase-js";
 import { getUserFromRequest } from "@/lib/auth";
+
+// Inicializar cliente Supabase del lado servidor usando Service Role
+const supabase = createClient(
+  process.env.SUPABASE_URL || "",
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE || ""
+);
 
 /**
  * API GET /api/eventos — obtener todos los eventos
  */
 export async function GET() {
   try {
-    // Compute per-event counts and archivado flag server-side so all clients
-    // receive a consistent view. `archivado` is true only when the event's
-    // end datetime (fecha + hora_fin) is in the past.
-    // Detect which column name the DB uses for the organizer (legacy vs new)
-    const colCheck = await query(
-      "SELECT column_name FROM information_schema.columns WHERE table_name = 'eventos' AND column_name IN ('id_organizador','organizador_id') LIMIT 1"
-    );
-    const organizadorCol =
-      (colCheck.rows[0] && colCheck.rows[0].column_name) || "id_organizador";
-    // whitelist to avoid unexpected values
-    const allowed = ["id_organizador", "organizador_id"];
-    const organizadorColumn = allowed.includes(organizadorCol)
-      ? organizadorCol
-      : "id_organizador";
+    // Obtener eventos desde Supabase y computar agregados en el servidor
+    // Comentarios y variables en español para claridad
 
-    // Detect which column name the DB uses for the auditorio (legacy vs new)
-    const audCheck = await query(
-      "SELECT column_name FROM information_schema.columns WHERE table_name = 'eventos' AND column_name IN ('id_auditorio','auditorio_id') LIMIT 1"
-    );
-    const auditorioCol =
-      (audCheck.rows[0] && audCheck.rows[0].column_name) || "id_auditorio";
-    const audAllowed = ["id_auditorio", "auditorio_id"];
-    const auditorioColumn = audAllowed.includes(auditorioCol)
-      ? auditorioCol
+    // 1) Traer todos los eventos (ordenados por fecha/hora)
+    const { data: eventosData, error: eventosError } = await supabase
+      .from("eventos")
+      .select("*")
+      .order("fecha", { ascending: false })
+      .order("hora_inicio", { ascending: true });
+
+    if (eventosError) throw eventosError;
+
+    const eventosRows = eventosData || [];
+
+    // 2) Detectar qué nombres de columna usa la BD según la primera fila (compatibilidad)
+    const sample = eventosRows[0] || {};
+    const organizadorColumn = sample.hasOwnProperty("id_organizador")
+      ? "id_organizador"
+      : sample.hasOwnProperty("organizador_id")
+      ? "organizador_id"
+      : "id_organizador";
+    const auditorioColumn = sample.hasOwnProperty("id_auditorio")
+      ? "id_auditorio"
+      : sample.hasOwnProperty("auditorio_id")
+      ? "auditorio_id"
       : "id_auditorio";
 
-    // Detect which column name registros_asistentes uses for the event FK
-    const raCheck = await query(
-      "SELECT column_name FROM information_schema.columns WHERE table_name = 'registros_asistentes' AND column_name IN ('id_evento','evento_id') LIMIT 1"
+    // 3) Recolectar ids para consultas en lote (organizadores, auditorios, registros)
+    const organizadorIds = Array.from(
+      new Set(
+        eventosRows
+          .map((e: any) => e[organizadorColumn])
+          .filter((v: any) => v !== null && v !== undefined)
+      )
     );
-    const raEventoCol =
-      (raCheck.rows[0] && raCheck.rows[0].column_name) || "id_evento";
+    const auditorioIds = Array.from(
+      new Set(
+        eventosRows
+          .map((e: any) => e[auditorioColumn])
+          .filter((v: any) => v !== null && v !== undefined)
+      )
+    );
+    const eventoIds = eventosRows.map((e: any) => e.id);
 
-    // Helper to inject the organizer column into SQL safely (only two allowed names)
-    const sql = `
-      SELECT
-        e.id,
-        e.titulo,
-        e.descripcion,
-        e.${organizadorColumn} as id_organizador,
-        e.${auditorioColumn} as id_auditorio,
-        e.fecha,
-        e.hora_inicio,
-        e.hora_fin,
-        e.asistentes_esperados,
-        e.estado,
-        e.tipo_evento,
-        e.carrera,
-        u.nombre as organizador_nombre,
-        u.email as organizador_email,
-        COALESCE(a.capacidad_total, e.asistentes_esperados, 0) AS capacidad_total,
-        COUNT(ra.*) FILTER (WHERE ra.estado = 'confirmado') AS asistentes_registrados,
-        -- archivado: true when fecha + hora_fin < now()
-        ((e.fecha + e.hora_fin) < NOW()) AS archivado
-      FROM eventos e
-      INNER JOIN usuarios u ON e.${organizadorColumn} = u.id
-      LEFT JOIN auditorios a ON e.${auditorioColumn} = a.id
-      LEFT JOIN registros_asistentes ra ON ra.${raEventoCol} = e.id
-      GROUP BY e.id, u.nombre, u.email, a.capacidad_total, e.${organizadorColumn}
-      ORDER BY e.fecha DESC, e.hora_inicio
-    `;
+    // 4) Traer organizadores y auditorios en batch
+    const usuariosPromise = organizadorIds.length
+      ? supabase.from("usuarios").select("id,nombre,email").in("id", organizadorIds)
+      : Promise.resolve({ data: [], error: null });
+    const auditoriosPromise = auditorioIds.length
+      ? supabase.from("auditorios").select("id,capacidad_total").in("id", auditorioIds)
+      : Promise.resolve({ data: [], error: null });
 
-    const result = await query(sql);
+    const [usuariosRes, auditoriosRes] = await Promise.all([usuariosPromise, auditoriosPromise]);
+    if (usuariosRes.error) throw usuariosRes.error;
+    if (auditoriosRes.error) throw auditoriosRes.error;
 
-    // Map DB rows to the shape the frontend expects (keep legacy keys too)
-    const mapped = result.rows.map((r: any) => ({
-      ...r,
-      asistentes: Number(r.asistentes_esperados || 0),
-      asistentes_registrados: Number(r.asistentes_registrados || 0),
-      capacidad_total: Number(r.capacidad_total || 0),
-      archivado: Boolean(r.archivado),
-    }));
+    const usuariosMap = (usuariosRes.data || []).reduce((acc: any, u: any) => {
+      acc[String(u.id)] = u;
+      return acc;
+    }, {});
+    const auditoriosMap = (auditoriosRes.data || []).reduce((acc: any, a: any) => {
+      acc[String(a.id)] = a;
+      return acc;
+    }, {});
+
+    // 5) Traer registros_confirmados para calcular asistentes_registrados por evento
+    // Evitar referenciar columnas concretas en la consulta (p.ej. `evento_id`) ya que
+    // algunos esquemas usan `id_evento` y referenciarlas en la cláusula SQL causa
+    // errores 42703 si no existen. En su lugar traemos filas filtradas por estado y
+    // filtramos en memoria por los ids de eventos.
+    let registrosConfirmados: any[] = [];
+    if (eventoIds.length > 0) {
+      const { data: regs, error: regsError } = await supabase
+        .from("registros_asistentes")
+        .select("*")
+        .eq("estado", "confirmado");
+      if (regsError) {
+        // Si falla la consulta por cualquier motivo, loguear y continuar sin conteos
+        console.warn("Warning: no se pudieron obtener registros_asistentes:", regsError);
+        registrosConfirmados = [];
+      } else {
+        registrosConfirmados = regs || [];
+      }
+      // Filtrar localmente por los eventoIds soportando ambas columnas
+      registrosConfirmados = registrosConfirmados.filter((r: any) => {
+        const eid = r.evento_id ?? r.id_evento ?? null;
+        if (!eid) return false;
+        return eventoIds.includes(String(eid));
+      });
+    }
+
+    // Agrupar conteos por evento (desde los registros ya filtrados)
+    const asistentesPorEvento: Record<string, number> = {};
+    registrosConfirmados.forEach((r: any) => {
+      const eid = r.evento_id ?? r.id_evento ?? null;
+      if (!eid) return;
+      asistentesPorEvento[String(eid)] = (asistentesPorEvento[String(eid)] || 0) + 1;
+    });
+
+    // 6) Mapear rows al formato esperado por el frontend
+    const mapped = eventosRows.map((e: any) => {
+      const orgId = e[organizadorColumn];
+      const audId = e[auditorioColumn];
+      const usuario = usuariosMap[String(orgId)] || {};
+      const aud = auditoriosMap[String(audId)] || {};
+      const asistentes_registrados = asistentesPorEvento[String(e.id)] || 0;
+      const capacidad_total = Number(aud.capacidad_total ?? e.asistentes_esperados ?? 0);
+      const fechaStr = e.fecha instanceof Date ? e.fecha.toISOString().substring(0, 10) : String(e.fecha).substring(0, 10);
+      const horaFin = (e.hora_fin || "").toString().substring(0, 5) || "23:59";
+      const end = new Date(`${fechaStr}T${horaFin}:00`);
+      const archivado = new Date() > end;
+
+      return {
+        id: e.id,
+        titulo: e.titulo,
+        descripcion: e.descripcion,
+        id_organizador: orgId,
+        id_auditorio: audId,
+        fecha: e.fecha instanceof Date ? e.fecha.toISOString().substring(0, 10) : String(e.fecha),
+        hora_inicio: (e.hora_inicio || "").toString().substring(0, 5),
+        hora_fin: (e.hora_fin || "").toString().substring(0, 5),
+        asistentes: Number(e.asistentes_esperados || 0),
+        estado: e.estado,
+        tipo_evento: e.tipo_evento || null,
+        carrera: e.carrera || null,
+        organizador_nombre: usuario.nombre || null,
+        organizador_email: usuario.email || null,
+        capacidad_total,
+        asistentes_registrados: Number(asistentes_registrados),
+        archivado: Boolean(archivado),
+      };
+    });
 
     return NextResponse.json(
       {
@@ -106,337 +172,160 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    console.log("Request body:", body);
-    // Accept both snake_case and id_* variants from clients
+    // Aceptar variantes snake_case o camelCase
     const auditorio_id = body.auditorio_id ?? body.id_auditorio ?? null;
-    const organizador_id = body.organizador_id ?? body.id_organizador ?? null;
-    const organizador_nombre =
-      body.organizador_nombre ?? body.organizadorNombre ?? null;
-    const organizador_email =
-      body.organizador_email ?? body.organizadorEmail ?? null;
+    let organizador_id = body.organizador_id ?? body.id_organizador ?? null;
+    const organizador_nombre = body.organizador_nombre ?? body.organizadorNombre ?? null;
+    const organizador_email = body.organizador_email ?? body.organizadorEmail ?? null;
     const titulo = body.titulo ?? null;
     const descripcion = body.descripcion ?? "";
     const fecha = body.fecha ?? null;
     const hora_inicio = body.hora_inicio ?? body.horaInicio ?? null;
     const hora_fin = body.hora_fin ?? body.horaFin ?? null;
-    const asistentes_esperados =
-      body.asistentes_esperados ?? body.asistentes ?? 0;
+    const asistentes_esperados = body.asistentes_esperados ?? body.asistentes ?? 0;
     const tipo_evento = body.tipo_evento ?? body.tipoEvento ?? null;
     const carrera = body.carrera ?? null;
 
-    // Detect DB column names used for eventos and registros_asistentes (compatibility)
-    const colCheck = await query(
-      "SELECT column_name FROM information_schema.columns WHERE table_name = 'eventos' AND column_name IN ('id_organizador','organizador_id') LIMIT 1"
-    );
-    const organizadorCol =
-      (colCheck.rows[0] && colCheck.rows[0].column_name) || "id_organizador";
-    const allowed = ["id_organizador", "organizador_id"];
-    const organizadorColumn = allowed.includes(organizadorCol)
-      ? organizadorCol
-      : "id_organizador";
-
-    const audCheck = await query(
-      "SELECT column_name FROM information_schema.columns WHERE table_name = 'eventos' AND column_name IN ('id_auditorio','auditorio_id') LIMIT 1"
-    );
-    const auditorioCol =
-      (audCheck.rows[0] && audCheck.rows[0].column_name) || "id_auditorio";
-    const audAllowed = ["id_auditorio", "auditorio_id"];
-    const auditorioColumn = audAllowed.includes(auditorioCol)
-      ? auditorioCol
-      : "id_auditorio";
-
-    const raCheck = await query(
-      "SELECT column_name FROM information_schema.columns WHERE table_name = 'registros_asistentes' AND column_name IN ('id_evento','evento_id') LIMIT 1"
-    );
-    const raEventoCol =
-      (raCheck.rows[0] && raCheck.rows[0].column_name) || "id_evento";
-
-    // Convertir auditorio_id a string si es necesario
-    const auditorioIdStr = auditorio_id !== null ? String(auditorio_id) : "";
-
-    // Validar campos requeridos
+    // Campos requeridos
     if (!auditorio_id || !titulo || !fecha || !hora_inicio || !hora_fin) {
-      return NextResponse.json(
-        { success: false, error: "Faltan campos requeridos" },
-        { status: 400 }
-      );
+      return NextResponse.json({ success: false, error: "Faltan campos requeridos" }, { status: 400 });
     }
 
-    // Validar que el auditorio_id sea válido (solo verificar que sea string no vacío)
-    if (typeof auditorioIdStr !== "string" || auditorioIdStr.trim() === "") {
-      return NextResponse.json(
-        { success: false, error: "Auditorio inválido" },
-        { status: 400 }
-      );
-    }
+    // Detectar nombres de columna compatibles revisando una fila de ejemplo
+    const { data: sampleArr } = await supabase.from('eventos').select('*').limit(1);
+    const sample = (sampleArr && sampleArr[0]) || {};
+    const organizadorColumn = sample.hasOwnProperty('id_organizador') ? 'id_organizador' : sample.hasOwnProperty('organizador_id') ? 'organizador_id' : 'id_organizador';
+    const auditorioColumn = sample.hasOwnProperty('id_auditorio') ? 'id_auditorio' : sample.hasOwnProperty('auditorio_id') ? 'auditorio_id' : 'id_auditorio';
 
     // Verificar que el auditorio existe
-    const auditorioCheck = await query(
-      "SELECT id FROM auditorios WHERE id = $1",
-      [auditorioIdStr]
-    );
-    if (auditorioCheck.rows.length === 0) {
-      return NextResponse.json(
-        { success: false, error: "Auditorio no encontrado" },
-        { status: 404 }
-      );
+    const { data: audCheck, error: audErr } = await supabase.from('auditorios').select('id,capacidad_total').eq('id', String(auditorio_id)).limit(1).maybeSingle();
+    if (audErr) throw audErr;
+    if (!audCheck) return NextResponse.json({ success: false, error: 'Auditorio no encontrado' }, { status: 404 });
+
+    // Resolver o crear organizador
+    const sessionUser = getUserFromRequest(request);
+    let finalOrganizadorId = organizador_id;
+    if (!finalOrganizadorId) {
+      if (sessionUser && sessionUser.tipo_usuario === 'organizador') {
+        finalOrganizadorId = String(sessionUser.id);
+      }
     }
 
-    // Resolve/crear organizador: if organizador_id provided validate it;
-    // si enviaron organizador_nombre lo creamos o buscamos por email (se requiere email en la tabla usuarios).
-    let finalOrganizadorId = organizador_id;
-    // Get session user to enforce roles
-    const sessionUser = getUserFromRequest(request);
     if (!finalOrganizadorId) {
-      if (!organizador_nombre || organizador_nombre.trim() === "") {
-        return NextResponse.json(
-          {
-            success: false,
-            error: "organizador_id o organizador_nombre requerido",
-          },
-          { status: 400 }
-        );
+      if (!organizador_nombre || String(organizador_nombre).trim() === '') {
+        return NextResponse.json({ success: false, error: 'organizador_id o organizador_nombre requerido' }, { status: 400 });
+      }
+      if (!organizador_email || String(organizador_email).trim() === '') {
+        return NextResponse.json({ success: false, error: 'organizador_email es requerido cuando se crea un organizador nuevo' }, { status: 400 });
       }
 
-      // When creating a new organizer we require an email
-      const orgEmail =
-        organizador_email ?? (body as any).organizador_email ?? null;
-      if (
-        !orgEmail ||
-        (typeof orgEmail === "string" && orgEmail.trim() === "")
-      ) {
-        return NextResponse.json(
-          {
-            success: false,
-            error:
-              "organizador_email es requerido cuando se crea un organizador nuevo",
-          },
-          { status: 400 }
-        );
-      }
-
-      // Buscar por email primero para evitar duplicados
-      const byEmail = await query(
-        "SELECT id FROM usuarios WHERE email = $1 LIMIT 1",
-        [orgEmail]
-      );
-      if (byEmail.rows.length > 0) {
-        finalOrganizadorId = byEmail.rows[0].id;
+      // Buscar por email primero
+      const { data: byEmail } = await supabase.from('usuarios').select('id').eq('email', organizador_email).limit(1);
+      if (byEmail && byEmail.length > 0) {
+        finalOrganizadorId = byEmail[0].id;
       } else {
-        const createRes = await query(
-          `INSERT INTO usuarios (nombre, email, tipo_usuario) VALUES ($1, $2, 'organizador') RETURNING id`,
-          [organizador_nombre, orgEmail]
-        );
-        finalOrganizadorId = createRes.rows[0].id;
+        const { data: created, error: createErr } = await supabase.from('usuarios').insert([{ nombre: organizador_nombre, email: organizador_email, tipo_usuario: 'organizador' }]).select('id').limit(1);
+        if (createErr) throw createErr;
+        finalOrganizadorId = created && created[0] && created[0].id;
       }
     } else {
-      const organizadorCheck = await query(
-        "SELECT tipo_usuario FROM usuarios WHERE id = $1",
-        [finalOrganizadorId]
-      );
-      if (organizadorCheck.rows.length === 0) {
-        return NextResponse.json(
-          { success: false, error: "Organizador no encontrado" },
-          { status: 404 }
-        );
-      }
-      if (organizadorCheck.rows[0].tipo_usuario !== "organizador") {
-        return NextResponse.json(
-          { success: false, error: "El usuario no es un organizador" },
-          { status: 400 }
-        );
-      }
+      // validar que el id exista y sea organizador
+      const { data: orgCheck } = await supabase.from('usuarios').select('tipo_usuario').eq('id', String(finalOrganizadorId)).limit(1);
+      if (!orgCheck || orgCheck.length === 0) return NextResponse.json({ success: false, error: 'Organizador no encontrado' }, { status: 404 });
+      if (orgCheck[0].tipo_usuario !== 'organizador') return NextResponse.json({ success: false, error: 'El usuario no es un organizador' }, { status: 400 });
     }
 
-    // Enforce that the session user is either the organizer creating the event or an admin
+    // Verificar permisos: admin o el mismo organizador
     if (sessionUser) {
       const sessId = String(sessionUser.id);
       const sessTipo = sessionUser.tipo_usuario || null;
-      const isAdmin = sessTipo === "admin";
-      const isOrganizerUser =
-        finalOrganizadorId && String(finalOrganizadorId) === sessId;
-      if (!isAdmin && !isOrganizerUser) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: "No autorizado: debe ser organizador o admin",
-          },
-          { status: 403 }
-        );
-      }
-      // If no finalOrganizadorId provided but session is organizer, assign it
-      if (!finalOrganizadorId && sessTipo === "organizador") {
-        finalOrganizadorId = sessId;
-      }
+      const isAdmin = sessTipo === 'admin';
+      const isOrganizerUser = finalOrganizadorId && String(finalOrganizadorId) === sessId;
+      if (!isAdmin && !isOrganizerUser) return NextResponse.json({ success: false, error: 'No autorizado: debe ser organizador o admin' }, { status: 403 });
     } else {
-      // No session: require organizer_id to be specified (or fail)
-      if (!finalOrganizadorId) {
-        return NextResponse.json(
-          {
-            success: false,
-            error: "Autenticación requerida para crear eventos",
-          },
-          { status: 401 }
-        );
-      }
+      // sin sesión requiere organizador explícito (ya resuelto arriba)
+      if (!finalOrganizadorId) return NextResponse.json({ success: false, error: 'Autenticación requerida para crear eventos' }, { status: 401 });
     }
 
-    // Comprobar evento existente que colisione (prevenir error de restricción única)
-    const existe = await query(
-      `SELECT 1 FROM eventos WHERE ${auditorioColumn} = $1 AND fecha = $2 AND hora_inicio = $3 LIMIT 1`,
-      [auditorioIdStr, fecha, hora_inicio]
-    );
-    if (existe.rows.length > 0) {
-      // Recuperar el evento conflictivo para dar más contexto al cliente
-      const conflictSql = `
-        SELECT e.*, u.nombre as organizador_nombre, u.email as organizador_email
-        FROM eventos e
-        INNER JOIN usuarios u ON e.${organizadorColumn} = u.id
-        WHERE e.${auditorioColumn} = $1 AND e.fecha = $2 AND e.hora_inicio = $3
-        LIMIT 1
-        `;
-      const conflictRes = await query(conflictSql, [
-        auditorioIdStr,
-        fecha,
-        hora_inicio,
-      ]);
-
-      return NextResponse.json(
-        {
-          success: false,
-          error: "Ya existe un evento en ese auditorio/fecha/hora",
-          conflict: conflictRes.rows[0] || null,
-        },
-        { status: 409 }
-      );
+    // Comprobar colisión
+    const { data: existe } = await supabase.from('eventos').select('id').eq(auditorioColumn, String(auditorio_id)).eq('fecha', fecha).eq('hora_inicio', hora_inicio).limit(1);
+    if (existe && existe.length > 0) {
+      // devolver conflicto
+      const { data: conflict } = await supabase.from('eventos').select(`*, usuarios:usuarios!inner(${organizadorColumn}=id)`)
+        .eq('id', existe[0].id).limit(1);
+      return NextResponse.json({ success: false, error: 'Ya existe un evento en ese auditorio/fecha/hora', conflict: conflict && conflict[0] ? conflict[0] : null }, { status: 409 });
     }
 
-    // Intentar insertar; si otro proceso insertó simultáneamente, evitar excepción de DB
-    // Existe un índice único (constraint) `no_overlap_eventos` sobre (auditorio_id, fecha, hora_inicio).
-    // Usamos ON CONFLICT para no lanzar error y detectar la colisión de forma controlada.
-    // Build INSERT dynamically to use correct organizer column
-    const insertCols = `${auditorioColumn}, ${organizadorColumn}, titulo, descripcion, fecha, hora_inicio, hora_fin, asistentes_esperados, estado, tipo_evento, carrera`;
-    const insertSql = `
-      INSERT INTO eventos (${insertCols})
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'confirmado', $9, $10)
-      ON CONFLICT ON CONSTRAINT no_overlap_eventos DO NOTHING
-      RETURNING *
-    `;
-    const insertRes = await query(insertSql, [
-      auditorioIdStr,
-      finalOrganizadorId,
+    // Insertar evento usando columnas detectadas
+    const insertObj: any = {
       titulo,
       descripcion,
       fecha,
       hora_inicio,
       hora_fin,
-      asistentes_esperados || 0,
-      tipo_evento || null,
-      carrera || null,
-    ]);
+      asistentes_esperados: asistentes_esperados || 0,
+      estado: 'confirmado',
+      tipo_evento: tipo_evento || null,
+      carrera: carrera || null,
+    };
+    insertObj[auditorioColumn] = String(auditorio_id);
+    insertObj[organizadorColumn] = finalOrganizadorId;
 
-    if (insertRes.rows.length === 0) {
-      // Significa que la inserción fue evitada por ON CONFLICT (ya existe un evento)
-      const conflictSql2 = `
-        SELECT e.*, u.nombre as organizador_nombre, u.email as organizador_email
-        FROM eventos e
-        INNER JOIN usuarios u ON e.${organizadorColumn} = u.id
-        WHERE e.${auditorioColumn} = $1 AND e.fecha = $2 AND e.hora_inicio = $3
-        LIMIT 1
-        `;
-      const conflictRes = await query(conflictSql2, [
-        auditorioIdStr,
-        fecha,
-        hora_inicio,
-      ]);
+    const { data: insertedArr, error: insertErr } = await supabase.from('eventos').insert([insertObj]).select().limit(1);
+    if (insertErr) throw insertErr;
+    const inserted = insertedArr && insertedArr[0];
+    if (!inserted) return NextResponse.json({ success: false, error: 'No se pudo crear el evento' }, { status: 500 });
 
-      return NextResponse.json(
-        {
-          success: false,
-          error: "Ya existe un evento en ese auditorio/fecha/hora",
-          conflict: conflictRes.rows[0] || null,
-        },
-        { status: 409 }
-      );
+    // Calcular asistentes registrados (intentar con evento_id y con id_evento)
+    let asistentes_registrados = 0;
+    const { data: regs1, error: regsErr1 } = await supabase.from('registros_asistentes').select('id').eq('evento_id', inserted.id).eq('estado', 'confirmado');
+    if (!regsErr1 && regs1) asistentes_registrados = regs1.length;
+    else {
+      const { data: regs2, error: regsErr2 } = await supabase.from('registros_asistentes').select('id').eq('id_evento', inserted.id).eq('estado', 'confirmado');
+      if (!regsErr2 && regs2) asistentes_registrados = regs2.length;
     }
 
-    // Obtener el evento insertado (junto con datos del organizador) y mapear
-    const eventoSql = `
-      SELECT e.*, u.nombre as organizador_nombre, u.email as organizador_email, a.capacidad_total
-      FROM eventos e
-      INNER JOIN usuarios u ON e.${organizadorColumn} = u.id
-      LEFT JOIN auditorios a ON e.${auditorioColumn} = a.id
-      WHERE e.id = $1
-      LIMIT 1
-      `;
-    const eventoRowRes = await query(eventoSql, [insertRes.rows[0].id]);
+    // Obtener capacidad_total del auditorio
+    const capacidad_total = audCheck.capacidad_total ?? inserted.asistentes_esperados ?? 0;
 
-    const row = eventoRowRes.rows[0];
-
-    // Compute aggregated counts for this event (asistentes confirmados)
-    const counts = await query(
-      `
-      SELECT
-        COALESCE(a.capacidad_total, 0) AS capacidad_total,
-        COUNT(ra.*) FILTER (WHERE ra.estado = 'confirmado') AS asistentes_registrados
-      FROM eventos e
-      LEFT JOIN auditorios a ON e.${auditorioColumn} = a.id
-      LEFT JOIN registros_asistentes ra ON ra.${raEventoCol} = e.id
-      WHERE e.id = $1
-      GROUP BY a.capacidad_total
-      `,
-      [insertRes.rows[0].id]
-    );
-
-    const capacidad_total = counts.rows[0]?.capacidad_total || 0;
-    const asistentes_registrados = Number(
-      counts.rows[0]?.asistentes_registrados || 0
-    );
-
-    // Compute archivado: true when fecha + hora_fin is before now
-    const fechaStr =
-      row.fecha instanceof Date
-        ? row.fecha.toISOString().substring(0, 10)
-        : String(row.fecha).substring(0, 10);
-    const horaFin = (row.hora_fin || "").toString().substring(0, 5) || "23:59";
-    const end = new Date(`${fechaStr}T${horaFin}:00`);
+    // Calcular archivado
+    const fechaStr = inserted.fecha instanceof Date ? inserted.fecha.toISOString().substring(0,10) : String(inserted.fecha).substring(0,10);
+    const horaFinStr = (inserted.hora_fin || hora_fin || '').toString().substring(0,5) || '23:59';
+    const end = new Date(`${fechaStr}T${horaFinStr}:00`);
     const archivado = new Date() > end;
 
-    // Mapear a la forma que el frontend espera (type Reserva)
     const mapped = {
-      id: row.id,
-      auditorio: String(row[auditorioColumn]),
-      fecha:
-        row.fecha instanceof Date
-          ? row.fecha.toISOString().substring(0, 10)
-          : String(row.fecha),
-      horaInicio: (row.hora_inicio || "").toString().substring(0, 5),
-      horaFin: (row.hora_fin || "").toString().substring(0, 5),
-      titulo: row.titulo,
-      organizador: row.organizador_nombre || null,
-      organizadorId: row[organizadorColumn],
-      descripcion: row.descripcion || "",
-      asistentes: row.asistentes_esperados || 0,
-      asistentes_registrados,
-      capacidad_total,
-      archivado,
-      carrera: row.carrera || null,
+      id: inserted.id,
+      auditorio: String(inserted[auditorioColumn] ?? auditorio_id),
+      fecha: inserted.fecha instanceof Date ? inserted.fecha.toISOString().substring(0,10) : String(inserted.fecha),
+      horaInicio: (inserted.hora_inicio || '').toString().substring(0,5),
+      horaFin: (inserted.hora_fin || '').toString().substring(0,5),
+      titulo: inserted.titulo,
+      organizador: null,
+      organizadorId: inserted[organizadorColumn],
+      descripcion: inserted.descripcion || '',
+      asistentes: inserted.asistentes_esperados || 0,
+      asistentes_registrados: Number(asistentes_registrados),
+      capacidad_total: Number(capacidad_total),
+      archivado: Boolean(archivado),
+      carrera: inserted.carrera || null,
       presentacion: null,
     };
 
-    // Emitir evento Socket.IO para sincronización en tiempo real con objeto mapeado
-    const { broadcastEvent } = await import("@/lib/socketServer");
-    await broadcastEvent("evento:creado", mapped);
+    // Intentar obtener datos del organizador para incluir nombre/email
+    const { data: orgData } = await supabase.from('usuarios').select('id,nombre,email').eq('id', mapped.organizadorId).limit(1);
+    if (orgData && orgData.length > 0) {
+      mapped.organizador = orgData[0].nombre || null;
+      mapped.organizador_email = orgData[0].email || null;
+    }
 
-    return NextResponse.json(
-      { success: true, evento: mapped },
-      { status: 201 }
-    );
+    // Emitir evento Socket.IO para sincronización en tiempo real
+    const { broadcastEvent } = await import('@/lib/socketServer');
+    await broadcastEvent('evento:creado', mapped);
+
+    return NextResponse.json({ success: true, evento: mapped }, { status: 201 });
   } catch (error: any) {
-    console.error("Error creating evento:", error);
-    return NextResponse.json(
-      { success: false, error: error.message || "Error al crear evento" },
-      { status: 500 }
-    );
+    console.error('Error creating evento:', error);
+    return NextResponse.json({ success: false, error: error?.message || String(error) || 'Error al crear evento' }, { status: 500 });
   }
 }

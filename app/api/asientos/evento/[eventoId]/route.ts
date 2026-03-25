@@ -1,5 +1,10 @@
 import { NextResponse } from "next/server";
-import { query, detectColumn } from "@/lib/db";
+import { createClient } from "@supabase/supabase-js";
+
+const supabase = createClient(
+  process.env.SUPABASE_URL || "",
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE || ""
+);
 
 export async function GET(
   request: Request,
@@ -19,92 +24,65 @@ export async function GET(
       );
     }
 
-    // Obtener auditorio asociado al evento (detectar nombre de columna en `eventos`)
-    const auditorioCol = await detectColumn("eventos", [
-      "id_auditorio",
-      "auditorio_id",
-    ]);
-    const ev = await query(
-      `SELECT ${auditorioCol} as id_auditorio FROM eventos WHERE id = $1`,
-      [eventoId]
-    );
-    if (ev.rows.length === 0) {
-      return NextResponse.json(
-        { success: false, error: "Evento no encontrado" },
-        { status: 404 }
-      );
+    // Obtener evento para detectar la columna de auditorio (compatibilidad)
+    const { data: evData, error: evErr } = await supabase.from('eventos').select('*').eq('id', eventoId).limit(1);
+    if (evErr) throw evErr;
+    if (!evData || evData.length === 0) return NextResponse.json({ success: false, error: 'Evento no encontrado' }, { status: 404 });
+    const evRow = evData[0];
+    const auditorioId = evRow.id_auditorio ?? evRow.auditorio_id;
+
+    // Traer asientos del auditorio
+    // Detectar columna de auditorio en tabla asientos (se asume auditorio_id en la mayoría de esquemas)
+    const asientosCol = 'auditorio_id';
+    const { data: asientosData, error: asientosErr } = await supabase.from('asientos').select('id,numero_asiento,fila,seccion').eq(asientosCol, auditorioId).order('numero_asiento');
+    if (asientosErr) throw asientosErr;
+
+    // Traer registros del evento (intentamos con 'evento_id' y 'id_evento')
+    let registros: any[] = [];
+    const { data: regsA, error: regsAErr } = await supabase.from('registros_asistentes').select('id,evento_id,id_evento,id_asistente,asiento_id,asiento_id as asientoId,numero_orden,estado').eq('evento_id', eventoId);
+    if (!regsAErr && regsA) registros = regsA;
+    else {
+      const { data: regsB, error: regsBErr } = await supabase.from('registros_asistentes').select('id,evento_id,id_evento,id_asistente,asiento_id,numero_orden,estado').eq('id_evento', eventoId);
+      if (regsBErr) throw regsBErr;
+      registros = regsB || [];
     }
-    const auditorioId = ev.rows[0].id_auditorio;
 
-    // Detectar columnas en registros_asistentes y en asientos para evitar referencias literales
-    const raAsientoCol = await detectColumn("registros_asistentes", [
-      "id_asiento",
-      "asiento_id",
-    ]);
-    const raEventoCol = await detectColumn("registros_asistentes", [
-      "id_evento",
-      "evento_id",
-    ]);
-    const raAsistenteCol = await detectColumn("registros_asistentes", [
-      "id_asistente",
-      "asistente_id",
-      "usuario_id",
-    ]);
-    const asientosAudCol = await detectColumn("asientos", [
-      "id_auditorio",
-      "auditorio_id",
-    ]);
+    // Mapear registros por asiento id
+    const regsByAsiento: Record<string, any> = {};
+    const asistenteIds: Set<any> = new Set();
+    for (const r of registros) {
+      const seatId = r.asiento_id ?? r.asientoId ?? null;
+      if (seatId) regsByAsiento[String(seatId)] = r;
+      if (r.id_asistente) asistenteIds.add(r.id_asistente);
+    }
 
-    // Traer asientos del auditorio e intentar unir con registros_asistentes del evento
-    const res = await query(
-      `
-      SELECT
-        a.id as asiento_id,
-        a.numero_asiento,
-        a.fila,
-        a.seccion,
-        ra.id as registro_id,
-        ra.${raAsistenteCol} as id_asistente,
-        ra.numero_orden,
-        ra.estado as registro_estado,
-        u.nombre as asistente_nombre,
-        u.email as asistente_email
-      FROM asientos a
-      LEFT JOIN registros_asistentes ra ON ra.${raAsientoCol} = a.id AND ra.${raEventoCol} = $1
-      LEFT JOIN usuarios u ON ra.${raAsistenteCol} = u.id
-      WHERE a.${asientosAudCol} = $2
-      ORDER BY a.numero_asiento
-      `,
-      [eventoId, auditorioId]
-    );
+    // Traer datos de usuarios en batch
+    let usuariosMap: Record<string, any> = {};
+    if (asistenteIds.size > 0) {
+      const ids = Array.from(asistenteIds);
+      const { data: users, error: usersErr } = await supabase.from('usuarios').select('id,nombre,email').in('id', ids as any[]);
+      if (usersErr) throw usersErr;
+      usuariosMap = (users || []).reduce((acc: any, u: any) => { acc[String(u.id)] = u; return acc; }, {});
+    }
 
-    const asientos = res.rows.map((r: any) => ({
-      asientoId: r.id_asiento,
-      numero_asiento: r.numero_asiento,
-      numeroAsiento: r.numero_asiento,
-      fila: r.fila,
-      seccion: r.seccion,
-      ocupado: r.registro_id
-        ? r.registro_estado === "confirmado"
-          ? true
-          : true
-        : false,
-      registroId: r.registro_id || null,
-      numero_orden: r.numero_orden || null,
-      asistente: r.registro_id
-        ? {
-            id: r.id_asistente,
-            nombre: r.asistente_nombre || null,
-            email: r.asistente_email || null,
-            numero_orden: r.numero_orden || null,
-          }
-        : null,
-    }));
+    const asientos = (asientosData || []).map((a: any) => {
+      const r = regsByAsiento[String(a.id)];
+      const ocupado = !!r;
+      const asistente = r ? (usuariosMap[String(r.id_asistente)] ? { id: r.id_asistente, nombre: usuariosMap[String(r.id_asistente)].nombre || null, email: usuariosMap[String(r.id_asistente)].email || null, numero_orden: r.numero_orden || null } : { id: r.id_asistente, numero_orden: r.numero_orden || null }) : null;
+      return {
+        asientoId: a.id,
+        numero_asiento: a.numero_asiento,
+        numeroAsiento: a.numero_asiento,
+        fila: a.fila,
+        seccion: a.seccion,
+        ocupado,
+        registroId: r?.id || null,
+        numero_orden: r?.numero_orden || null,
+        asistente,
+      };
+    });
 
-    return NextResponse.json(
-      { success: true, auditorioId, asientos },
-      { status: 200 }
-    );
+    return NextResponse.json({ success: true, auditorioId, asientos }, { status: 200 });
   } catch (err: any) {
     console.error("Error fetching asientos por evento:", err);
     return NextResponse.json(

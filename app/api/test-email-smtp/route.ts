@@ -1,6 +1,6 @@
 /**
- * Test email endpoint - Direct SMTP via NodeMailer (not Next.js API route)
- * GET /api/test-email-smtp - Returns test result
+   *  Prueba del punto final del correo electrónico: SMTP directo a través de mailjet
+ * GET /api/test-email-smtp - Devuelve el resultado de la prueba
  */
 
 export async function GET(request: Request) {

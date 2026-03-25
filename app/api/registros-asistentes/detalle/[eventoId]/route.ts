@@ -1,5 +1,10 @@
 import { NextResponse } from "next/server";
-import { query } from "@/lib/db";
+import { createClient } from "@supabase/supabase-js";
+
+const supabase = createClient(
+  process.env.SUPABASE_URL || "",
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_ROLE || ""
+);
 
 export async function GET(
   request: Request,
@@ -19,41 +24,53 @@ export async function GET(
       );
     }
 
-    const res = await query(
-      `
-      SELECT
-        ra.id as registro_id,
-        ra.id_evento,
-        ra.id_asistente,
-        ra.id_asiento,
-        ra.numero_orden,
-        ra.fecha_registro,
-        ra.estado,
-        u.nombre as asistente_nombre,
-        u.email as asistente_email,
-        a.numero_asiento,
-        a.fila,
-        a.seccion
-      FROM registros_asistentes ra
-      LEFT JOIN usuarios u ON ra.id_asistente = u.id
-      LEFT JOIN asientos a ON ra.id_asiento = a.id
-      WHERE ra.id_evento = $1
-      ORDER BY ra.numero_orden NULLS LAST, ra.fecha_registro
-      `,
-      [eventoId]
-    );
+    // Traer registros del evento; intentamos con ambas columnas de FK
+    let registrosData: any[] = [];
+    const { data: regsA, error: regsAErr } = await supabase
+      .from("registros_asistentes")
+      .select("id,id_evento,evento_id,id_asistente,asiento_id,numero_orden,fecha_registro,estado")
+      .eq("id_evento", eventoId)
+      .order("numero_orden", { ascending: true });
+    if (!regsAErr && regsA) registrosData = regsA;
+    else {
+      const { data: regsB, error: regsBErr } = await supabase
+        .from("registros_asistentes")
+        .select("id,id_evento,evento_id,id_asistente,asiento_id,numero_orden,fecha_registro,estado")
+        .eq("evento_id", eventoId)
+        .order("numero_orden", { ascending: true });
+      if (regsBErr) throw regsBErr;
+      registrosData = regsB || [];
+    }
 
-    const registros = res.rows.map((r: any) => ({
-      registroId: r.registro_id,
-      eventoId: r.id_evento,
+    // Recolectar ids para buscar usuarios y asientos
+    const asistenteIds = Array.from(new Set(registrosData.map((r: any) => r.id_asistente).filter(Boolean)));
+    const asientoIds = Array.from(new Set(registrosData.map((r: any) => r.asiento_id).filter(Boolean)));
+
+    const usuariosMap: Record<string, any> = {};
+    if (asistenteIds.length > 0) {
+      const { data: users, error: usersErr } = await supabase.from("usuarios").select("id,nombre,email").in("id", asistenteIds as any[]);
+      if (usersErr) throw usersErr;
+      (users || []).forEach((u: any) => (usuariosMap[String(u.id)] = u));
+    }
+
+    const asientosMap: Record<string, any> = {};
+    if (asientoIds.length > 0) {
+      const { data: asientos, error: asientosErr } = await supabase.from("asientos").select("id,numero_asiento,fila,seccion").in("id", asientoIds as any[]);
+      if (asientosErr) throw asientosErr;
+      (asientos || []).forEach((a: any) => (asientosMap[String(a.id)] = a));
+    }
+
+    const registros = registrosData.map((r: any) => ({
+      registroId: r.id,
+      eventoId: r.id_evento ?? r.evento_id,
       asistenteId: r.id_asistente,
-      nombre: r.asistente_nombre || null,
-      email: r.asistente_email || null,
-      asientoId: r.id_asiento || null,
-      numero_asiento: r.numero_asiento || null,
-      fila: r.fila || null,
-      seccion: r.seccion || null,
-      numero_orden: r.numero_orden || null,
+      nombre: usuariosMap[String(r.id_asistente)]?.nombre ?? null,
+      email: usuariosMap[String(r.id_asistente)]?.email ?? null,
+      asientoId: r.asiento_id ?? null,
+      numero_asiento: asientosMap[String(r.asiento_id)]?.numero_asiento ?? null,
+      fila: asientosMap[String(r.asiento_id)]?.fila ?? null,
+      seccion: asientosMap[String(r.asiento_id)]?.seccion ?? null,
+      numero_orden: r.numero_orden ?? null,
       fecha_registro: r.fecha_registro,
       estado: r.estado,
     }));

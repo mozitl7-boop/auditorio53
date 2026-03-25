@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { query } from "@/lib/db";
+import supabaseAdmin from "@/lib/supabaseServer";
 
 /**
  * GET /api/eventos/horarios-libres?auditorio_id=A&fecha=2025-11-21&limit=3
@@ -21,13 +21,14 @@ export async function GET(request: Request) {
     }
 
     // Obtener horarios ocupados en esa fecha/auditorio
-    const res = await query(
-      `SELECT hora_inicio FROM eventos WHERE auditorio_id = $1 AND fecha = $2`,
-      [auditorio_id, fecha]
-    );
+    const { data: res } = await supabaseAdmin
+      .from("eventos")
+      .select("hora_inicio")
+      .eq("auditorio_id", auditorio_id)
+      .eq("fecha", fecha);
 
     const ocupados = new Set(
-      res.rows.map((r: any) => {
+      (res || []).map((r: any) => {
         // normalizar 'HH:MM:SS' a 'HH:MM'
         const v = (r.hora_inicio || "").toString();
         return v.length >= 5 ? v.substring(0, 5) : v;

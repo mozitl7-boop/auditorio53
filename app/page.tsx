@@ -112,7 +112,7 @@ export default function Page() {
             presentacion: null,
           }));
           setReservas(mapped);
-          // Also fetch existing registros so new sessions show historical data
+          // También recuperar registros existentes para que las nuevas sesiones muestren datos históricos.
           try {
             const rres = await fetch(`/api/registros-asistentes/all`);
             const rjson = await rres.json();
@@ -246,7 +246,20 @@ export default function Page() {
       }
     };
 
+    // Manejar evento eliminado: remover de la lista local
+    const handleEventoEliminado = (payload: any) => {
+      try {
+        const id = payload && (payload.id || payload.eventoId || payload.reservaId);
+        if (!id) return;
+        setReservas((prev) => prev.filter((r) => r.id !== id));
+        setAsistentesRegistrados((prev) => prev.filter((a) => a.reservaId !== id));
+      } catch (err) {
+        console.error("Error procesando evento:eliminado socket:", err);
+      }
+    };
+
     socket.on("evento:creado", handleEventoCreado);
+    socket.on("evento:eliminado", handleEventoEliminado);
 
     // Escuchar conteos agregados emitidos por el servidor
     const handleConteo = (payload: any) => {
@@ -342,7 +355,7 @@ export default function Page() {
                     carrera: e.carrera || null,
                     presentacion: null,
                   }));
-                  // Merge without duplicating
+                  // Combinar sin duplicar
                   setReservas((prev) => {
                     const ids = new Set(prev.map((p) => p.id));
                     const merged = [...prev];
@@ -379,18 +392,19 @@ export default function Page() {
                 }
               }
             } catch (e) {
-              // ignore polling errors
+              // ignorar errores de sondeo
             }
           }, 5000);
         }
       }
     } catch (e) {
-      // ignore
+      // ignorar
     }
 
     return () => {
       socket.off("asistente:registrado", handleRegistro);
       socket.off("evento:creado", handleEventoCreado);
+      socket.off("evento:eliminado", handleEventoEliminado);
       socket.off("asientos:conteo", handleConteo);
       if (poller) clearInterval(poller);
     };
@@ -439,7 +453,7 @@ export default function Page() {
 
   const eliminarAsistente = async (reservaId: string, asistenteId: string) => {
     try {
-      // Determine caller id: prefer the reservation's organizer id (server-side value)
+      // Determinar el identificador de llamada: dar preferencia al identificador del organizador de la reserva (valor del lado del servidor).
       // TEMP LOG: verificar que el handler del cliente se ejecute al hacer click
       console.info("Client handler eliminarAsistente called", {
         reservaId,
@@ -474,7 +488,7 @@ export default function Page() {
         return false;
       }
 
-      // Refresh registros for this reserva from server to keep UI consistent
+      // También recuperar registros para esta reserva desde el servidor para mantener la UI consistente
       try {
         const rres = await fetch(`/api/registros-asistentes/${reservaId}`);
         const rjson = await rres.json();
@@ -491,12 +505,12 @@ export default function Page() {
               new Date().toISOString(),
           }));
           setAsistentesRegistrados((prev) => {
-            // keep other reservas' registros intact, replace those for this reserva
+            // mantener intactos los registros de otras reservas, sustituir los de esta reserva
             const others = prev.filter((p) => p.reservaId !== reservaId);
             return [...others, ...regs];
           });
         } else {
-          // fallback: remove locally
+          // fallback: eliminar localmente
           setAsistentesRegistrados((prev) =>
             prev.filter((a) => a.id !== asistenteId)
           );
@@ -608,7 +622,7 @@ export default function Page() {
         <div className="container mx-auto px-4 py-6">
           <LoginUsuario
             onSelect={(user) => {
-              // Set mode according to user tipo
+              // Configurar el modo según el tipo de usuario
               if (user.tipo_usuario === "organizador") {
                 setUserIds((prev) => ({
                   ...prev,
@@ -619,14 +633,14 @@ export default function Page() {
                 setUserIds((prev) => ({ ...prev, asistente: String(user.id) }));
                 setModoUsuario("asistente");
               } else if (user.tipo_usuario === "admin") {
-                // admins see organizer interface
+                // los administradores ven la interfaz de organizador
                 setUserIds((prev) => ({
                   ...prev,
                   organizador: String(user.id),
                 }));
                 setModoUsuario("organizador");
               } else {
-                // fallback to asistente
+                // fallback a asistente
                 setUserIds((prev) => ({ ...prev, asistente: String(user.id) }));
                 setModoUsuario("asistente");
               }

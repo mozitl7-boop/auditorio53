@@ -1,31 +1,30 @@
 import { NextResponse } from "next/server";
-import { query } from "@/lib/db";
+import supabaseAdmin from "@/lib/supabaseServer";
 
 /**
  * API GET /api/usuarios/organizadores — obtener usuarios tipo organizador
+ * Usa `supabaseAdmin` (clave de servicio) para consultas server-side.
  */
 export async function GET() {
   try {
-    const result = await query(
-      `
-      SELECT id, nombre, email
-      FROM usuarios
-      WHERE tipo_usuario = 'organizador'
-      ORDER BY nombre
-      `
-    );
+    // Obtener organizadores desde la tabla `usuarios`
+    const { data, error } = await supabaseAdmin
+      .from("usuarios")
+      .select("id,nombre,email")
+      .eq("tipo_usuario", "organizador")
+      .order("nombre", { ascending: true });
 
-    return NextResponse.json(
-      { success: true, count: result.rows.length, organizadores: result.rows },
-      { status: 200 }
-    );
+    if (error) {
+      console.error("Error al obtener organizadores (supabase):", error.message || error);
+      return NextResponse.json({ success: false, error: error.message || String(error) }, { status: 500 });
+    }
+
+    const organizadores = data || [];
+    return NextResponse.json({ success: true, count: organizadores.length, organizadores }, { status: 200 });
   } catch (error: any) {
     console.error("Error fetching organizadores:", error);
     return NextResponse.json(
-      {
-        success: false,
-        error: error.message || "Error al obtener organizadores",
-      },
+      { success: false, error: error.message || "Error al obtener organizadores" },
       { status: 500 }
     );
   }

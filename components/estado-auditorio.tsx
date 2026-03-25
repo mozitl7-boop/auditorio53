@@ -104,12 +104,19 @@ export function EstadoAuditorio({
                 <div className="flex items-center gap-1.5 text-sm mt-1 text-white/90">
                   <Users className="w-4 h-4" />
                   <span>
-                    {estadoA.reserva
-                      ? `${contarOcupados(
-                          estadoA.reserva.id,
-                          168
-                        )} / 168 personas`
-                      : `0 / 168 personas`}
+                    {estadoA.reserva ? (
+                      (() => {
+                        const reserva = estadoA.reserva as any;
+                        const agg = asientosConteo[reserva.id] || null;
+                        const capacidad = Number(
+                          (agg && agg.capacidad) || reserva.capacidad_total || reserva.asistentes || 168
+                        );
+                        const ocupados = contarOcupados(reserva.id, capacidad);
+                        return `${ocupados} / ${capacidad} personas`;
+                      })()
+                    ) : (
+                      "0 / 168 personas"
+                    )}
                   </span>
                 </div>
               </div>
@@ -160,12 +167,19 @@ export function EstadoAuditorio({
                 <div className="flex items-center gap-1.5 text-sm mt-1 text-white/90">
                   <Users className="w-4 h-4" />
                   <span>
-                    {estadoB.reserva
-                      ? `${contarOcupados(
-                          estadoB.reserva.id,
-                          168
-                        )} / 168 personas`
-                      : `0 / 168 personas`}
+                    {estadoB.reserva ? (
+                      (() => {
+                        const reserva = estadoB.reserva as any;
+                        const agg = asientosConteo[reserva.id] || null;
+                        const capacidad = Number(
+                          (agg && agg.capacidad) || reserva.capacidad_total || reserva.asistentes || 168
+                        );
+                        const ocupados = contarOcupados(reserva.id, capacidad);
+                        return `${ocupados} / ${capacidad} personas`;
+                      })()
+                    ) : (
+                      "0 / 168 personas"
+                    )}
                   </span>
                 </div>
               </div>

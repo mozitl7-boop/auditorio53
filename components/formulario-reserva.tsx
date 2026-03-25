@@ -114,12 +114,22 @@ export function FormularioReserva({
     async function fetchOrganizadores() {
       try {
         const res = await fetch("/api/usuarios/organizadores");
-        const data = await res.json();
-        if (mounted && data.success) {
+        const text = await res.text();
+        let data: any;
+        try {
+          data = text ? JSON.parse(text) : {};
+        } catch (e) {
+          console.error("Organizadores: respuesta no-JSON:", text);
+          data = { success: false, error: "Respuesta no JSON del servidor", raw: text };
+        }
+
+        if (mounted && data && data.success) {
           setOrganizadores(data.organizadores || []);
           if (data.organizadores && data.organizadores.length > 0) {
             setOrganizadorId(data.organizadores[0].id);
           }
+        } else if (mounted) {
+          console.warn("No se obtuvieron organizadores:", data && data.error ? data.error : data);
         }
       } catch (err) {
         console.error("Error fetching organizadores:", err);
@@ -228,6 +238,46 @@ export function FormularioReserva({
           description: `${datosFormulario.titulo} reservado exitosamente.`,
         });
 
+        // Informar al componente padre para que actualice la lista sin necesitar F5
+        try {
+          if (typeof alEnviar === "function") {
+            // Usar el objeto `evento` devuelto por el servidor si está disponible
+            const nuevoEvento = result.evento
+              ? {
+                  id: result.evento.id,
+                  auditorio: String(result.evento.id_auditorio || result.evento.auditorio || datosFormulario.auditorio) as "A" | "B",
+                  fecha: (result.evento.fecha || datosFormulario.fecha).substring(0, 10),
+                  horaInicio: (result.evento.hora_inicio || datosFormulario.horaInicio).toString().substring(0, 5),
+                  horaFin: (result.evento.hora_fin || horaFinTexto).toString().substring(0, 5),
+                  titulo: result.evento.titulo || datosFormulario.titulo,
+                  organizador: result.evento.organizador_nombre || datosFormulario.organizador || null,
+                  organizadorId: result.evento.id_organizador || organizadorId || undefined,
+                  descripcion: result.evento.descripcion || datosFormulario.descripcion || "",
+                  asistentes: Number((result.evento.asistentes_esperados ?? Number.parseInt(datosFormulario.asistentes)) || 0),
+                  archivado: result.evento.archivado || false,
+                  carrera: result.evento.carrera || datosFormulario.carrera || null,
+                  presentacion: null,
+                }
+              : {
+                  auditorio: datosFormulario.auditorio,
+                  fecha: datosFormulario.fecha,
+                  horaInicio: datosFormulario.horaInicio,
+                  horaFin: horaFinTexto,
+                  titulo: datosFormulario.titulo,
+                  organizador: datosFormulario.organizador || null,
+                  descripcion: datosFormulario.descripcion || "",
+                  asistentes: Number.parseInt(datosFormulario.asistentes) || 0,
+                  carrera: datosFormulario.carrera || null,
+                };
+
+            // Llamar al callback para que el UI padre actualice su estado inmediatamente
+            alEnviar(nuevoEvento as any);
+          }
+        } catch (e) {
+          // No bloquear el flujo si falla el callback
+          console.warn("alEnviar callback failed:", e);
+        }
+
         // Limpiar formulario
         establecerDatosFormulario({
           auditorio: "A",
@@ -324,6 +374,9 @@ export function FormularioReserva({
       </div>
 
       <form onSubmit={manejarEnvio} className="space-y-5">
+        <p className="text-xs text-gray-500">
+          Nota: no necesitas presionar <strong>F5</strong>; la lista se actualizará automáticamente.
+        </p>
         <div>
           <Label className="text-base font-semibold mb-3 block">
             Auditorio

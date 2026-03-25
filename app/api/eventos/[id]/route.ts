@@ -1,16 +1,16 @@
 import { NextResponse } from "next/server";
-import { query } from "@/lib/db";
 import { getUserFromRequest } from "@/lib/auth";
+import supabaseAdmin from "@/lib/supabaseServer";
 
 /**
  * API DELETE /api/eventos/:id — eliminar evento (solo organizador)
  */
 export async function DELETE(request: Request, { params }: { params: any }) {
   try {
-    // `params` may be a promise-like object in Next's app router — await it
+    // `params` puede ser un objeto similar a una promesa en el enrutador de aplicaciones de Next; espere a que se complete.
     const paramsObj = await params;
     const id = paramsObj?.id;
-    // Prefer session-based user (cookie). Fallback to header/body for dev.
+    // Preferir usuario basado en sesión (cookie). Recurrir al encabezado/cuerpo para desarrollo.
     const body = await request.json().catch(() => ({} as any));
     const sessionUser = getUserFromRequest(request);
     let callerId = sessionUser ? String(sessionUser.id) : null;
@@ -31,12 +31,12 @@ export async function DELETE(request: Request, { params }: { params: any }) {
       );
     }
 
-    // Validate callerId is a UUID to avoid DB errors/hangs when casting
+    // Validar que callerId sea un UUID para evitar errores/colgamientos en la BD al hacer cast
     const isUuid = (v: any) =>
       typeof v === "string" &&
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
     if (!isUuid(callerId)) {
-      console.error("Invalid callerId provided to DELETE /api/eventos/:id", {
+      console.error("ID de usuario inválido proporcionado a DELETE /api/eventos/:id", {
         callerId,
       });
       return NextResponse.json(
@@ -46,50 +46,54 @@ export async function DELETE(request: Request, { params }: { params: any }) {
     }
 
     // Antes de eliminar, obtener emails de asistentes y datos del organizador
-    // Detectar nombre de columna del organizador (compatibilidad: id_organizador vs organizador_id)
-    const colCheck = await query(
-      "SELECT column_name FROM information_schema.columns WHERE table_name = 'eventos' AND column_name IN ('id_organizador','organizador_id') LIMIT 1"
-    );
-    const organizadorCol =
-      (colCheck.rows[0] && colCheck.rows[0].column_name) || "id_organizador";
-    const allowed = ["id_organizador", "organizador_id"];
-    const organizadorColumn = allowed.includes(organizadorCol)
-      ? organizadorCol
-      : "id_organizador";
+    // Detectar columna del organizador probando ambas columnas en una sola consulta
+    const { data: evtCols } = await supabaseAdmin
+      .from("eventos")
+      .select("id,id_organizador,organizador_id")
+      .eq("id", id)
+      .limit(1);
+    const row = (evtCols && evtCols[0]) || {};
+    const organizadorColumn = row.organizador_id ? "organizador_id" : "id_organizador";
 
     let attendeeEmails: string[] = [];
     let organizadorEmail: string | null = null;
     try {
-      const evt = await query(
-        `SELECT e.id, e.${organizadorColumn} as id_organizador, u.email as organizador_email FROM eventos e INNER JOIN usuarios u ON e.${organizadorColumn} = u.id WHERE e.id = $1 LIMIT 1`,
-        [id]
-      );
-      if (evt.rows.length > 0) {
-        organizadorEmail = evt.rows[0].organizador_email || null;
+      // Obtener email del organizador
+      const { data: organizadorRows } = await supabaseAdmin
+        .from("eventos")
+        .select(`${organizadorColumn}`)
+        .eq("id", id)
+        .limit(1);
+      const orgId = organizadorRows && organizadorRows[0] && organizadorRows[0][organizadorColumn];
+      if (orgId) {
+        const { data: urows } = await supabaseAdmin.from("usuarios").select("email").eq("id", orgId).limit(1);
+        organizadorEmail = urows && urows[0] && urows[0].email ? urows[0].email : null;
       }
 
-      const attendees = await query(
-        `SELECT u.email FROM registros_asistentes ra JOIN usuarios u ON ra.id_asistente = u.id WHERE ra.id_evento = $1`,
-        [id]
-      );
-      attendeeEmails = attendees.rows.map((r: any) => r.email).filter(Boolean);
+      // Obtener asistentes y sus emails
+      const { data: registros } = await supabaseAdmin.from("registros_asistentes").select("id_asistente").eq("id_evento", id);
+      const asistIds = (registros || []).map((r: any) => r.id_asistente).filter(Boolean);
+      if (asistIds.length > 0) {
+        const { data: usuarios } = await supabaseAdmin.from("usuarios").select("email").in("id", asistIds);
+        attendeeEmails = (usuarios || []).map((u: any) => u.email).filter(Boolean);
+      }
     } catch (e) {
-      // ignore gather errors
+      // ignorar errores de recopilación
       console.error(
-        "Warning: no se pudieron obtener emails antes de eliminar:",
+        "Advertencia: no se pudieron obtener emails antes de eliminar:",
         e
       );
     }
 
-    // Perform deletion regardless of caller ownership (temporary bypass of organizer-only restriction)
+    // Realizar eliminación independientemente de la propiedad del llamador (omisión temporal de la restricción de solo organizador)
     try {
-      console.info("Deleting evento (ownership check bypassed)", {
+      console.info("Eliminando evento (omisión de verificación de propiedad)", {
         eventoId: id,
         callerId,
         callerTipo,
       });
 
-      // Validate id is a UUID before performing DB operations
+      // Validar que id sea un UUID antes de realizar operaciones en la BD
       const isUuidEvent = (v: any) =>
         typeof v === "string" &&
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
@@ -102,25 +106,13 @@ export async function DELETE(request: Request, { params }: { params: any }) {
         );
       }
 
-      await query("BEGIN");
-      try {
-        await query("DELETE FROM registros_asistentes WHERE id_evento = $1", [
-          id,
-        ]);
-        const delEvt = await query(
-          "DELETE FROM eventos WHERE id = $1 RETURNING id",
-          [id]
-        );
-        await query("COMMIT");
-        if (delEvt.rows.length === 0) {
-          return NextResponse.json(
-            { success: false, error: "Evento no encontrado" },
-            { status: 404 }
-          );
-        }
-      } catch (innerErr) {
-        await query("ROLLBACK");
-        throw innerErr;
+      // Nota: la operación siguiente no se ejecuta en una transacción.
+      // considere crear una function/RPC en la DB.
+      await supabaseAdmin.from("registros_asistentes").delete().eq("id_evento", id);
+      const { data: delEvt, error: delErr } = await supabaseAdmin.from("eventos").delete().eq("id", id).select("id");
+      if (delErr) throw delErr;
+      if (!delEvt || delEvt.length === 0) {
+        return NextResponse.json({ success: false, error: "Evento no encontrado" }, { status: 404 });
       }
 
       // Emitir evento por sockets (si existe el helper)
